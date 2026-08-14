@@ -1,0 +1,37 @@
+{
+  "name": "dsh-subscription-auth",
+  "version": "0.1.0",
+  "description": "订阅会员 OAuth 登录（ChatGPT 等）：配置中心「订阅服务」页登录/注销，自动发现订阅模型列表",
+  "private": true,
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": { "types": "./lib/types/index.d.ts", "default": "./lib/index.js" },
+    "./client": { "types": "./lib/types/client.d.ts", "default": "./lib/client.js" },
+    "./package.json": "./package.json"
+  },
+  "files": ["lib"],
+  "license": "BSD-3-Clause",
+  "engines": { "dsh": ">=0.0.1" },
+  "dshx": {
+    "contributes": { "tools": [], "skills": [] }
+  },
+  "dsh": {
+    "client": {
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1-rc.1",
+    "@deepseek-ai/dsh-llm": "^0.0.1",
+    "@deepseek-ai/dsh-credentials": "^0.0.1",
+    "@deepseek-ai/dsh-settings": "^0.0.1"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0"
+  }
+}
