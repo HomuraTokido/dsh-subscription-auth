@@ -69,9 +69,21 @@
 
 3. 在模型选择里切到对应的提供商（如「Claude (订阅)」），选一个模型即可对话。
 
+   模型选择器可为订阅模型选择**思考强度（推理等级）**：
+   - ChatGPT：`minimal / low / medium / high`（默认 `medium`，作为 codex Responses 的 `reasoning.effort` 发送）
+   - Claude：`low / medium / high`（默认 `medium`，映射为 extended thinking 的 `budget_tokens` 8192 / 16384 / 32000）
+   - Grok：`low / medium / high`（不设默认，选择后作为 xAI Responses 的 `reasoning.effort` 发送）
+   - Kimi：`low / medium / high`（不设默认，映射为 `thinking.budget_tokens` 4096 / 16384 / 32768）
+
+   不选择时走提供商默认行为（请求体不带思考参数）。
+
 4. 点右上角「注销」删除已保存的令牌与模型列表。
 
 > 注意：授权码渠道（ChatGPT / Claude）需要在本机运行 dsh，因为回调落在 `127.0.0.1`。
+
+> 注意：**未登录的提供商不会出现在模型选择器里**（provider/adapter 按登录状态注册）：登录成功后才注册进模型列表，注销后自动移除。设置 → 订阅服务 页始终列出全部四个渠道以便登录。
+
+> 注意：**已登录的提供商在 dsh 启动时即自动注册并发现模型**（启动门控会等待 credential 服务就绪，settings 就绪后还会补一次检查），无需先进入设置页。
 
 ## 配置
 

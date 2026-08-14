@@ -12,7 +12,7 @@
  * 同一角色的连续块合并进同一条 message（Anthropic 要求 user/assistant 交替）。
  * @module dsh-subscription-auth/adapters/anthropic
  */
-import { LlmAdapter, LlmError, CallId, attributionHeaders } from '@deepseek-ai/dsh-llm'
+import { LlmAdapter, LlmError, CallId, ReasoningEffortId, attributionHeaders } from '@deepseek-ai/dsh-llm'
 import type {
   GenerateOptions,
   LlmModelInfo,
@@ -23,6 +23,7 @@ import type {
   TokenUsage,
 } from '@deepseek-ai/dsh-llm'
 import type { AdapterModel } from '../adapter.js'
+import type { ChannelReasoning } from '../channel.js'
 
 export interface AnthropicAdapterOptions {
   apiBaseURL: string
@@ -38,6 +39,8 @@ export interface AnthropicAdapterConfig {
   options(): AnthropicAdapterOptions
   /** 每次请求前解析（必要时刷新）出可用的 access token。 */
   resolveAccessToken(): Promise<{ access: string }>
+  /** 思考强度档位（缺省不提供）。effort id 映射为 thinking.budget_tokens。 */
+  reasoning?: ChannelReasoning
   /** 错误信息与 providerInfo 里的标签（默认 'anthropic' / 'Claude (订阅)'）。 */
   label?: string
   displayName?: string
@@ -51,7 +54,11 @@ function flattenText(blocks: ContentBlock[]): string {
   return out
 }
 
-function serializeRequest(options: GenerateOptions, o: AnthropicAdapterOptions): unknown {
+function serializeRequest(
+  options: GenerateOptions,
+  o: AnthropicAdapterOptions,
+  reasoning: ChannelReasoning | undefined,
+): unknown {
   const messages: any[] = []
   let system = options.system
 
@@ -105,6 +112,15 @@ function serializeRequest(options: GenerateOptions, o: AnthropicAdapterOptions):
     stream: true,
   }
   if (system !== undefined && system !== '') body.system = system
+  // 思考强度：用户显式选择（或渠道声明默认档位）时启用 extended thinking，
+  // effort 档位映射为 thinking budget_tokens（档位未声明 budget 时用 16384）。
+  if (reasoning !== undefined && options.reasoningEffort !== undefined) {
+    const effort = reasoning.efforts.find((e) => e.id === options.reasoningEffort)
+    body.thinking = {
+      type: 'enabled',
+      budget_tokens: effort?.budgetTokens ?? 16384,
+    }
+  }
   if (options.tools !== undefined && options.tools.length > 0) {
     body.tools = options.tools.map((t) => ({
       name: t.name,
@@ -351,6 +367,7 @@ export class AnthropicMessagesAdapter extends LlmAdapter {
   resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
     const o = this.cfg.options()
     const m = o.models.find((x) => x.id === model)
+    const reasoning = this.cfg.reasoning
     return Promise.resolve({
       provider,
       id: model,
@@ -358,6 +375,21 @@ export class AnthropicMessagesAdapter extends LlmAdapter {
       inputModalities: ['text'],
       context: { contextWindow: m?.contextWindow ?? o.defaultContextWindow },
       defaultMaxTokens: o.maxTokens,
+      // 声明思考强度档位 → 模型选择器显示「推理等级」菜单。
+      ...(reasoning !== undefined
+        ? {
+            reasoning: {
+              efforts: reasoning.efforts.map((e) => ({
+                id: ReasoningEffortId(e.id),
+                name: e.name,
+                ...(e.description !== undefined ? { description: e.description } : {}),
+              })),
+              ...(reasoning.defaultEffort !== undefined
+                ? { defaultEffort: ReasoningEffortId(reasoning.defaultEffort) }
+                : {}),
+            },
+          }
+        : {}),
     })
   }
 
@@ -365,7 +397,7 @@ export class AnthropicMessagesAdapter extends LlmAdapter {
     const o = this.cfg.options()
     const label = this.cfg.label ?? 'anthropic'
     const token = await this.cfg.resolveAccessToken()
-    const body = serializeRequest(options, o)
+    const body = serializeRequest(options, o, this.cfg.reasoning)
     const headers: Record<string, string> = {
       authorization: `Bearer ${token.access}`,
       'content-type': 'application/json',

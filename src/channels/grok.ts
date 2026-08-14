@@ -9,7 +9,7 @@ import { ChatGptAdapter } from '../adapter.js'
 import type { AdapterModel } from '../adapter.js'
 import { openBrowser } from '../oauth.js'
 import { pollDeviceFlow } from '../device-flow.js'
-import type { ChannelContext, ChannelDefinition, ChannelRuntime } from '../channel.js'
+import type { ChannelContext, ChannelDefinition, ChannelReasoning, ChannelRuntime } from '../channel.js'
 
 const CLIENT_ID = 'b1a00492-073a-47ea-816f-4c329264a828'
 const SCOPE = 'openid profile email offline_access grok-cli:access api:access'
@@ -24,6 +24,15 @@ const DEFAULT_MODELS: AdapterModel[] = [
   { id: 'grok-4.20-0309-non-reasoning', name: 'Grok 4.20 (Non-Reasoning)', contextWindow: 2000000 },
   { id: 'grok-composer-2.5-fast', name: 'Grok Composer 2.5 Fast', contextWindow: 200000 },
 ]
+
+/** xAI Responses API 的 reasoning.effort 取值；无默认档位（用户显式选择才发送）。 */
+const REASONING: ChannelReasoning = {
+  efforts: [
+    { id: 'low', name: 'Low' },
+    { id: 'medium', name: 'Medium' },
+    { id: 'high', name: 'High' },
+  ],
+}
 
 /** 从 OIDC 元数据发现 token_endpoint（设备流 / 续期共用）。 */
 async function discoverTokenEndpoint(): Promise<string> {
@@ -195,6 +204,7 @@ export const grokChannel: ChannelDefinition = {
   defaultContextWindow: 1_000_000,
   defaultMaxTokens: 8192,
   defaultModels: DEFAULT_MODELS,
+  reasoning: REASONING,
 
   create(ctx: ChannelContext): ChannelRuntime {
     let controller: AbortController | undefined
@@ -207,6 +217,7 @@ export const grokChannel: ChannelDefinition = {
         models: ctx.options().models,
         defaultContextWindow: ctx.options().defaultContextWindow,
       }),
+      reasoning: REASONING,
       resolveAccessToken: async () => {
         const token = await ctx.readToken()
         if (!token) {

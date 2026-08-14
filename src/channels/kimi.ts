@@ -11,7 +11,7 @@ import { AnthropicMessagesAdapter } from '../adapters/anthropic.js'
 import type { AdapterModel } from '../adapter.js'
 import { pollDeviceFlow } from '../device-flow.js'
 import { openBrowser } from '../oauth.js'
-import type { ChannelContext, ChannelDefinition, ChannelRuntime, StoredToken } from '../channel.js'
+import type { ChannelContext, ChannelDefinition, ChannelReasoning, ChannelRuntime, StoredToken } from '../channel.js'
 
 const AUTH_BASE = 'https://auth.kimi.com'
 const DEVICE_AUTHORIZATION_URL = 'https://auth.kimi.com/api/oauth/device_authorization'
@@ -29,6 +29,15 @@ const DEFAULT_MODELS: AdapterModel[] = [
   { id: 'kimi-k2.6', name: 'Kimi K2.6', contextWindow: 262_144 },
   { id: 'kimi-k2.5', name: 'Kimi K2.5', contextWindow: 262_144 },
 ]
+
+/** 思考强度 → thinking budget_tokens（Anthropic 兼容端点）；无默认档位。 */
+const REASONING: ChannelReasoning = {
+  efforts: [
+    { id: 'low', name: 'Low', budgetTokens: 4_096 },
+    { id: 'medium', name: 'Medium', budgetTokens: 16_384 },
+    { id: 'high', name: 'High', budgetTokens: 32_768 },
+  ],
+}
 
 /** 进程内稳定的通用请求头（device id 只生成一次并缓存）。 */
 let deviceId: string | undefined
@@ -181,6 +190,7 @@ export const kimiChannel: ChannelDefinition = {
   defaultContextWindow: 262_144,
   defaultMaxTokens: 32_768,
   defaultModels: DEFAULT_MODELS,
+  reasoning: REASONING,
 
   create(ctx: ChannelContext): ChannelRuntime {
     let controller: AbortController | undefined
@@ -194,6 +204,7 @@ export const kimiChannel: ChannelDefinition = {
         defaultContextWindow: ctx.options().defaultContextWindow,
         headers: () => kimiCommonHeaders(),
       }),
+      reasoning: REASONING,
       resolveAccessToken: async () => {
         const token = await ctx.readToken()
         if (!token) {

@@ -1,7 +1,7 @@
 {
   "name": "dsh-subscription-auth",
-  "version": "0.1.0",
-  "description": "订阅会员 OAuth 登录（ChatGPT 等）：配置中心「订阅服务」页登录/注销，自动发现订阅模型列表",
+  "version": "0.2.1",
+  "description": "订阅会员 OAuth 登录（ChatGPT 等）：配置中心「订阅服务」页登录/注销，自动发现订阅模型列表，按登录状态注册提供商，支持思考强度选择",
   "private": true,
   "type": "module",
   "main": "lib/index.js",

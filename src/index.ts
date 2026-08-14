@@ -120,12 +120,17 @@ interface ChannelState {
   channelCtx: ChannelContext
   settingsScope?: { get(): ChannelConfig; update(patch: ChannelConfig): Promise<void> }
   discovered?: { models: AdapterModel[]; at: number }
+  /** 模型发现/登录状态变化后刷新注册（announce：让 UI 重新拉取列表）。 */
   replaceRegistration?: () => void
+  /** 按登录状态注册/撤销 provider + adapter（false = 从模型列表移除）。 */
+  syncRegistration?: (enabled: boolean) => void
 }
 
 export function apply(ctx: Context, config: Record<string, unknown> = {}): void {
   const states = new Map<string, ChannelState>()
   const credentials = () => ctx.get('credentials') as CredentialProvider | undefined
+  /** 插件卸载后停止启动门控轮询。 */
+  const gateStopped = new Map<string, boolean>()
 
   // ---------- 每个渠道：构建 ctx + runtime ----------
   for (const def of CHANNELS) {
@@ -214,6 +219,8 @@ export function apply(ctx: Context, config: Record<string, unknown> = {}): void 
   async function logoutChannel(st: ChannelState): Promise<void> {
     await st.runtime.logout()
     st.discovered = undefined
+    // 注销后从模型列表移除该提供商（未登录不再占用模型选择器）。
+    st.syncRegistration?.(false)
     if (st.settingsScope !== undefined) {
       try {
         await st.settingsScope.update({ discoveredModels: [] })
@@ -241,6 +248,21 @@ export function apply(ctx: Context, config: Record<string, unknown> = {}): void 
         const st = states.get(id)
         if (st !== undefined) st.settingsScope = scope
       }
+      // settings 就绪后补一次检查：覆盖启动门控完成时 settingsScope 尚未
+      // 注册的场景（此时发现结果无法持久化，且注册可能已被竞态误撤）。
+      // 已登录 → 确保注册 + 触发一次发现；发现成功会把 discoveredModels
+      // 持久化到刚就绪的 settings 命名空间。
+      for (const { id } of created) {
+        const st = states.get(id)
+        if (st === undefined) continue
+        void (async () => {
+          if (gateStopped.get(id) === true) return
+          const token = await st.channelCtx.readToken()
+          if (gateStopped.get(id) === true || token === undefined) return
+          st.syncRegistration?.(true)
+          if (st.discovered === undefined) void discoverAndStore(st)
+        })()
+      }
       return () => {
         for (const { id } of created) {
           const st = states.get(id)
@@ -250,23 +272,59 @@ export function apply(ctx: Context, config: Record<string, unknown> = {}): void 
     }, 'subscription-auth.settings')
   })
 
-  // ---------- provider + adapter 注册 ----------
+  // ---------- provider + adapter 注册（按登录状态门控） ----------
+  // 未登录的渠道不注册 provider/adapter：其模型不会出现在模型选择器里。
+  // 登录成功（afterLogin → discoverAndStore → notifyModelsChanged）后注册，
+  // 注销时撤销。registerConfigurableProviders / registerAdapter 初次注册
+  // 必须至少一个条目，因此先全量注册，再按令牌状态异步收窄（令牌读取是
+  // 异步的，且发生在启动早期，UI 目录加载前即可收敛）。
   for (const def of CHANNELS) {
     const st = states.get(def.id)!
-    ctx.llm.registerConfigurableProviders([
-      {
-        provider: def.id,
-        displayName: def.displayName,
-        settingsNs: channelNamespace(def.id),
-        settingsPath: [],
-      },
-    ])
-    const registration = ctx.llm.registerAdapter([def.id], st.runtime.adapter)
-    st.replaceRegistration = () => registration.replace([def.id])
+    const entry = {
+      provider: def.id,
+      displayName: def.displayName,
+      settingsNs: channelNamespace(def.id),
+      settingsPath: [] as string[],
+    }
+    const providersHandle = ctx.llm.registerConfigurableProviders([entry])
+    const adapterHandle = ctx.llm.registerAdapter([def.id], st.runtime.adapter)
+    let registered = true
+    const sync = (next: boolean, announce: boolean): void => {
+      if (next === registered && !announce) return
+      providersHandle.replace(next ? [entry] : [])
+      adapterHandle.replace(next ? [def.id] : [])
+      registered = next
+    }
+    st.syncRegistration = (next: boolean) => sync(next, false)
+    // 模型发现后刷新（announce：即使注册状态没变也发 llm/adapters-updated，
+    // 让模型选择器等 UI 重新拉取发现到的模型列表）。
+    st.replaceRegistration = () => sync(true, true)
+    // 启动门控：credential 服务可能晚于本插件激活（apply 时序竞态），
+    // 若尚未就绪则轮询等待（约 60s 上限；插件卸载即停止），再读令牌决定
+    // 是否注册 provider + 触发模型发现。否则未就绪时会把已登录的渠道误判
+    // 为未登录而撤销注册，导致启动后模型列表为空，直到访问设置页兜底。
+    let attempts = 0
+    const gate = async (): Promise<void> => {
+      if (gateStopped.get(def.id) === true || attempts >= 200) return
+      attempts += 1
+      if (credentials() === undefined) {
+        setTimeout(() => { void gate() }, 300)
+        return
+      }
+      const token = await st.channelCtx.readToken()
+      if (gateStopped.get(def.id) === true) return
+      const loggedIn = token !== undefined
+      sync(loggedIn, false)
+      logLine(`[${def.id}] 登录状态: ${loggedIn ? '已登录，注册 provider' : '未登录，不注册 provider'}`)
+      // 已登录但内存没有发现结果（如升级后存量会话）：顺手触发一次发现。
+      if (loggedIn) void discoverAndStore(st)
+    }
+    void gate()
   }
 
-  // ---------- 插件停止时中止所有进行中的登录会话 ----------
+  // ---------- 插件停止时中止所有进行中的登录会话与启动门控轮询 ----------
   ctx.effect(() => () => {
+    for (const def of CHANNELS) gateStopped.set(def.id, true)
     for (const st of states.values()) st.runtime.cancelLogin()
   }, 'subscription-auth.auth-cleanup')
 

@@ -15,7 +15,7 @@ import {
   waitForCallback,
 } from '../oauth.js'
 import { fetchCodexModels } from '../discovery.js'
-import type { ChannelContext, ChannelDefinition, ChannelRuntime } from '../channel.js'
+import type { ChannelContext, ChannelDefinition, ChannelReasoning, ChannelRuntime } from '../channel.js'
 
 const DEFAULT_MODELS: AdapterModel[] = [
   { id: 'gpt-5.5', name: 'GPT-5.5', contextWindow: 400_000 },
@@ -24,6 +24,17 @@ const DEFAULT_MODELS: AdapterModel[] = [
   { id: 'gpt-5.3-codex-spark', name: 'GPT-5.3 Codex Spark', contextWindow: 400_000 },
   { id: 'gpt-5.5-pro', name: 'GPT-5.5 Pro', contextWindow: 400_000 },
 ]
+
+/** codex Responses API 的 reasoning.effort 取值（与 opencode 一致）。 */
+const REASONING: ChannelReasoning = {
+  efforts: [
+    { id: 'minimal', name: 'Minimal' },
+    { id: 'low', name: 'Low' },
+    { id: 'medium', name: 'Medium' },
+    { id: 'high', name: 'High' },
+  ],
+  defaultEffort: 'medium',
+}
 
 export const chatgptChannel: ChannelDefinition = {
   id: 'chatgpt',
@@ -36,6 +47,7 @@ export const chatgptChannel: ChannelDefinition = {
   defaultContextWindow: 400_000,
   defaultMaxTokens: 8192,
   defaultModels: DEFAULT_MODELS,
+  reasoning: REASONING,
 
   create(ctx: ChannelContext): ChannelRuntime {
     let controller: AbortController | undefined
@@ -48,6 +60,7 @@ export const chatgptChannel: ChannelDefinition = {
         models: ctx.options().models,
         defaultContextWindow: ctx.options().defaultContextWindow,
       }),
+      reasoning: REASONING,
       resolveAccessToken: async () => {
         const token = await ctx.readToken()
         if (!token) {

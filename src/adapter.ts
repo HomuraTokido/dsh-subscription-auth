@@ -11,7 +11,7 @@
  *   - tool-result → { type: 'function_call_output', call_id, output }
  * @module dsh-subscription-auth/adapter
  */
-import { LlmAdapter, LlmError, CallId, attributionHeaders } from '@deepseek-ai/dsh-llm'
+import { LlmAdapter, LlmError, CallId, ReasoningEffortId, attributionHeaders } from '@deepseek-ai/dsh-llm'
 import type {
   GenerateOptions,
   LlmModelInfo,
@@ -21,6 +21,7 @@ import type {
   ContentBlock,
   TokenUsage,
 } from '@deepseek-ai/dsh-llm'
+import type { ChannelReasoning } from './channel.js'
 
 export interface AdapterModel {
   id: string
@@ -40,6 +41,8 @@ export interface AdapterConfig {
   options(): AdapterOptions
   /** 每次请求前解析（必要时刷新）出可用的 access token。 */
   resolveAccessToken(): Promise<{ access: string }>
+  /** 思考强度档位（缺省不提供）。effort id 原样作为 reasoning.effort 发送。 */
+  reasoning?: ChannelReasoning
   /** 错误信息与 providerInfo 里的标签（默认 'chatgpt' / 'ChatGPT (订阅)'）。 */
   label?: string
   displayName?: string
@@ -53,7 +56,11 @@ function flattenText(blocks: ContentBlock[]): string {
   return out
 }
 
-function serializeRequest(options: GenerateOptions, o: AdapterOptions): unknown {
+function serializeRequest(
+  options: GenerateOptions,
+  o: AdapterOptions,
+  reasoning: ChannelReasoning | undefined,
+): unknown {
   const input: any[] = []
   let instructions = options.system
 
@@ -121,6 +128,11 @@ function serializeRequest(options: GenerateOptions, o: AdapterOptions): unknown 
     store: false,
   }
   if (instructions !== undefined) body.instructions = instructions
+  // 思考强度：仅在用户显式选择（或渠道声明默认档位）时发送 reasoning.effort；
+  // 不声明 reasoning 的渠道不发送该字段（codex 端点对未知参数会 400）。
+  if (reasoning !== undefined && options.reasoningEffort !== undefined) {
+    body.reasoning = { effort: options.reasoningEffort }
+  }
   if (options.tools !== undefined && options.tools.length > 0) {
     body.tools = options.tools.map((t) => ({
       type: 'function',
@@ -386,6 +398,7 @@ export class ChatGptAdapter extends LlmAdapter {
   resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
     const o = this.cfg.options()
     const m = o.models.find((x) => x.id === model)
+    const reasoning = this.cfg.reasoning
     return Promise.resolve({
       provider,
       id: model,
@@ -393,6 +406,21 @@ export class ChatGptAdapter extends LlmAdapter {
       inputModalities: ['text'],
       context: { contextWindow: m?.contextWindow ?? o.defaultContextWindow },
       defaultMaxTokens: o.maxTokens,
+      // 声明思考强度档位 → 模型选择器显示「推理等级」菜单。
+      ...(reasoning !== undefined
+        ? {
+            reasoning: {
+              efforts: reasoning.efforts.map((e) => ({
+                id: ReasoningEffortId(e.id),
+                name: e.name,
+                ...(e.description !== undefined ? { description: e.description } : {}),
+              })),
+              ...(reasoning.defaultEffort !== undefined
+                ? { defaultEffort: ReasoningEffortId(reasoning.defaultEffort) }
+                : {}),
+            },
+          }
+        : {}),
     })
   }
 
@@ -400,7 +428,7 @@ export class ChatGptAdapter extends LlmAdapter {
     const o = this.cfg.options()
     const label = this.cfg.label ?? 'chatgpt'
     const token = await this.cfg.resolveAccessToken()
-    const body = serializeRequest(options, o)
+    const body = serializeRequest(options, o, this.cfg.reasoning)
     const headers: Record<string, string> = {
       authorization: `Bearer ${token.access}`,
       'content-type': 'application/json',

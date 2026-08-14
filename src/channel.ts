@@ -7,6 +7,23 @@ import type { LlmAdapter } from '@deepseek-ai/dsh-llm'
 import type { CredentialProvider } from '@deepseek-ai/dsh-credentials'
 import type { AdapterModel } from './adapter.js'
 
+/** 思考强度档位（模型选择器「推理等级」菜单的一项）。 */
+export interface ReasoningEffort {
+  /** 档位 id：OpenAI/xAI Responses API 直接作为 reasoning.effort 发送。 */
+  id: string
+  name: string
+  description?: string
+  /** Anthropic 系渠道（Claude/Kimi）：该档位对应的 thinking budget_tokens。 */
+  budgetTokens?: number
+}
+
+/** 渠道级思考强度配置；缺省表示该渠道不提供思考强度选择。 */
+export interface ChannelReasoning {
+  efforts: ReasoningEffort[]
+  /** 缺省档位；缺省时 UI 提供 "Default"（不发送，用提供商默认行为）。 */
+  defaultEffort?: string
+}
+
 /** 持久化在 credential 里的令牌（JSON 字符串）。 */
 export interface StoredToken {
   refresh: string
@@ -100,5 +117,7 @@ export interface ChannelDefinition {
   defaultContextWindow: number
   defaultMaxTokens: number
   defaultModels: AdapterModel[]
+  /** 思考强度选项（缺省不提供）。登录后发现的模型同样继承渠道级档位。 */
+  reasoning?: ChannelReasoning
   create(ctx: ChannelContext): ChannelRuntime
 }

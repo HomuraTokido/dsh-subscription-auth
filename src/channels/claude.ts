@@ -8,7 +8,7 @@ import { LlmError } from '@deepseek-ai/dsh-llm'
 import { AnthropicMessagesAdapter } from '../adapters/anthropic.js'
 import type { AdapterModel } from '../adapter.js'
 import { generatePkce, openBrowser, waitForCallback } from '../oauth.js'
-import type { ChannelContext, ChannelDefinition, ChannelRuntime } from '../channel.js'
+import type { ChannelContext, ChannelDefinition, ChannelReasoning, ChannelRuntime } from '../channel.js'
 import type { StoredToken } from '../channel.js'
 
 const CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
@@ -30,6 +30,16 @@ const defaultModels: AdapterModel[] = [
 const ANTHROPIC_VERSION = '2023-06-01'
 const ANTHROPIC_BETA =
   'claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11'
+
+/** 思考强度 → extended thinking budget_tokens（Claude 官方推荐预算区间）。 */
+const REASONING: ChannelReasoning = {
+  efforts: [
+    { id: 'low', name: 'Low', budgetTokens: 8_192 },
+    { id: 'medium', name: 'Medium', budgetTokens: 16_384 },
+    { id: 'high', name: 'High', budgetTokens: 32_000 },
+  ],
+  defaultEffort: 'medium',
+}
 
 function redirectUri(port: number): string {
   return 'http://localhost:' + port + CALLBACK_PATH
@@ -132,6 +142,7 @@ export const claudeChannel: ChannelDefinition = {
   defaultContextWindow: 1_000_000,
   defaultMaxTokens: 64000,
   defaultModels,
+  reasoning: REASONING,
 
   create(ctx: ChannelContext): ChannelRuntime {
     let controller: AbortController | undefined
@@ -148,6 +159,7 @@ export const claudeChannel: ChannelDefinition = {
           'anthropic-beta': ANTHROPIC_BETA,
         }),
       }),
+      reasoning: REASONING,
       resolveAccessToken: async () => {
         const token = await ctx.readToken()
         if (!token) {
