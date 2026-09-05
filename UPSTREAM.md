@@ -77,7 +77,8 @@
   为 cordis 的 `Context` 增强出 `settings` 字段。
 - `peerDependencies` 中三个 `@deepseek-ai/*` 从 `^0.0.1-rc.1` 提升到 `^0.1.0-rc.5`，
   并新增 `@deepseek-ai/dsh-attachment`（图片支持所需，上游 JS 实现靠鸭子类型
-  规避了这条依赖声明）。
+  规避了这条依赖声明）。该 peer 标记为 optional：图片序列化在宿主未注册附件
+  服务时退化为文本占位，插件本身不依赖它才能启动。
 
 ### 工程改动
 
