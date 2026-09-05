@@ -15,6 +15,7 @@ const CLIENT_ID = 'b1a00492-073a-47ea-816f-4c329264a828'
 const SCOPE = 'openid profile email offline_access grok-cli:access api:access'
 
 const DEFAULT_MODELS: AdapterModel[] = [
+  { id: 'grok-4.6', name: 'Grok 4.6', contextWindow: 500000 },
   { id: 'grok-4.3', name: 'Grok 4.3', contextWindow: 1000000 },
   { id: 'grok-build', name: 'Grok Build', contextWindow: 512000 },
   { id: 'grok-build-0.1', name: 'Grok Build 0.1', contextWindow: 256000 },
@@ -105,10 +106,8 @@ async function exchangeDeviceCode(
       device_code: deviceCode,
     }).toString(),
   })
-  // 设备流轮询即使逻辑失败通常也返回 HTTP 200（body 里带 error 字段）
-  if (!res.ok) return { status: 'failed', message: `设备授权轮询失败 (HTTP ${res.status})` }
   const body = await res.json().catch(() => ({})) as any
-  if (typeof body?.access_token === 'string' && body.access_token !== '') {
+  if (res.ok && typeof body?.access_token === 'string' && body.access_token !== '') {
     return { status: 'complete', value: body }
   }
   switch (body?.error) {
@@ -201,7 +200,7 @@ export const grokChannel: ChannelDefinition = {
   tokenRefName: 'GROK_SUBSCRIPTION_TOKEN',
   defaultApiBaseURL: 'https://api.x.ai/v1/responses',
   defaultRedirectPort: 0,
-  defaultContextWindow: 1_000_000,
+  defaultContextWindow: 500_000,
   defaultMaxTokens: 8192,
   defaultModels: DEFAULT_MODELS,
   reasoning: REASONING,
@@ -217,6 +216,7 @@ export const grokChannel: ChannelDefinition = {
         models: ctx.options().models,
         defaultContextWindow: ctx.options().defaultContextWindow,
       }),
+      attachments: ctx.attachments,
       reasoning: REASONING,
       resolveAccessToken: async () => {
         const token = await ctx.readToken()
@@ -281,7 +281,7 @@ export const grokChannel: ChannelDefinition = {
         } catch (error: any) {
           this.cancelLogin()
           ctx.log(`初始化登录失败: ${error?.message ?? error}`)
-          return { status: 'pending' }
+          throw error
         }
       },
 

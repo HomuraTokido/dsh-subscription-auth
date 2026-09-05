@@ -5,6 +5,7 @@
  */
 import type { LlmAdapter } from '@deepseek-ai/dsh-llm'
 import type { CredentialProvider } from '@deepseek-ai/dsh-credentials'
+import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
 import type { AdapterModel } from './adapter.js'
 
 /** 思考强度档位（模型选择器「推理等级」菜单的一项）。 */
@@ -82,6 +83,8 @@ export interface ChannelContext {
   /** 持久化配置片段（如 discoveredModels）。 */
   updateConfig(patch: ChannelConfig): Promise<void>
   credentials(): CredentialProvider | undefined
+  /** 附件服务（读取用户上传的图片等）；宿主未安装该服务时返回 undefined。 */
+  attachments(): AttachmentStore | undefined
   log(message: string): void
   /** 触发 llm/adapters-updated，让模型选择器等 UI 重新拉取列表。 */
   notifyModelsChanged(): void

@@ -1,0 +1,7 @@
+# 仓库的规范文本形式是 LF，checkout 时同样保持 LF：工作区与仓库之间不留转换
+# 边界，任何主机上看到的都是同一种字节形式，补丁应用与 blob 比对不会因平台而异。
+# 收养这份 fork 时全仓已经是 LF，这行只是把既成状态钉住，防止在
+# core.autocrlf=true 的 Windows 上 clone 再提交时混入 CRLF。
+# 若某类文件确实需要工作区里是 CRLF（cmd.exe 的 .bat/.cmd），在本行之后追加
+# `*.bat text eol=crlf` 这样的覆盖——仓库内形式仍是 LF，CRLF 只是 checkout 时的呈现。
+* text=auto eol=lf

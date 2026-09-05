@@ -5,7 +5,7 @@
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Khellendros97/dsh-subscription-auth.git"
+    "url": "git+https://github.com/HomuraTokido/dsh-subscription-auth.git"
   },
   "publishConfig": {
     "access": "public"
@@ -24,8 +24,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "bun scripts/build-bun.mjs",
-    "prepublishOnly": "bun scripts/build-bun.mjs",
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node tests/lib-check.mjs && node tests/apply-wiring.mjs && node tests/reasoning-wire.mjs"
   },
   "license": "BSD-3-Clause",
@@ -51,9 +51,10 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-llm": "^0.0.1-rc.1",
-    "@deepseek-ai/dsh-credentials": "^0.0.1-rc.1",
-    "@deepseek-ai/dsh-settings": "^0.0.1-rc.1"
+    "@deepseek-ai/dsh-llm": "^0.1.0-rc.5",
+    "@deepseek-ai/dsh-credentials": "^0.1.0-rc.5",
+    "@deepseek-ai/dsh-settings": "^0.1.0-rc.5",
+    "@deepseek-ai/dsh-attachment": "^0.1.0-rc.5"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/cordis": { "optional": true }
@@ -62,6 +63,7 @@
     "@deepseek-ai/schemastery": "^3.18.1"
   },
   "devDependencies": {
+    "esbuild": "^0.28.1",
     "typescript": "^5.9.0"
   }
 }

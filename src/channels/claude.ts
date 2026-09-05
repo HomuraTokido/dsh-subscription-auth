@@ -159,6 +159,7 @@ export const claudeChannel: ChannelDefinition = {
           'anthropic-beta': ANTHROPIC_BETA,
         }),
       }),
+      attachments: ctx.attachments,
       reasoning: REASONING,
       resolveAccessToken: async () => {
         const token = await ctx.readToken()

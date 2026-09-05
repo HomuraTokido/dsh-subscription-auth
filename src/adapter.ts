@@ -11,7 +11,7 @@
  *   - tool-result → { type: 'function_call_output', call_id, output }
  * @module dsh-subscription-auth/adapter
  */
-import { LlmAdapter, LlmError, CallId, ReasoningEffortId, attributionHeaders } from '@deepseek-ai/dsh-llm'
+import { LlmAdapter, LlmError, ToolCallId, ReasoningEffortId, attributionHeaders } from '@deepseek-ai/dsh-llm'
 import type {
   GenerateOptions,
   LlmModelInfo,
@@ -19,8 +19,10 @@ import type {
   LlmProviderInfo,
   StreamChunk,
   ContentBlock,
+  ImageBlock,
   TokenUsage,
 } from '@deepseek-ai/dsh-llm'
+import type { AttachmentStore, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import type { ChannelReasoning } from './channel.js'
 
 export interface AdapterModel {
@@ -46,6 +48,15 @@ export interface AdapterConfig {
   /** 错误信息与 providerInfo 里的标签（默认 'chatgpt' / 'ChatGPT (订阅)'）。 */
   label?: string
   displayName?: string
+  /**
+   * 附件服务，供 user 消息里的图片块读取原始字节序列化为 input_image。
+   * 运行时两条接线路径传进来的都是取值函数：channels/*.ts 传 ctx.attachments，
+   * 而 ChannelContext.attachments 本身就是 index.ts 装配的 () => ctx.get('attachments')。
+   * 这里仍然允许直接传服务实例，是为了对齐补丁在 stream() 里保留的 typeof 归一化
+   * （见 lib/adapter.js 的 `typeof this.cfg.attachments === 'function' ? ... : ...`）。
+   * 注意函数分支可以返回 undefined——宿主尚未注册 attachments 服务时就是这种情况。
+   */
+  attachments?: AttachmentStore | (() => AttachmentStore | undefined)
 }
 
 function flattenText(blocks: ContentBlock[]): string {
@@ -56,11 +67,40 @@ function flattenText(blocks: ContentBlock[]): string {
   return out
 }
 
-function serializeRequest(
+function serializeImagePart(
+  attachment: ImageAttachmentRef,
+  bytes: Uint8Array,
+): { type: 'input_image'; image_url: string } {
+  const mediaType = attachment.mediaType || 'image/png'
+  return {
+    type: 'input_image',
+    image_url: `data:${mediaType};base64,${Buffer.from(bytes).toString('base64')}`,
+  }
+}
+
+async function serializeUserImage(
+  block: ImageBlock,
+  attachments: AttachmentStore | undefined,
+  signal: AbortSignal | undefined,
+): Promise<{ type: 'input_image'; image_url: string } | { type: 'input_text'; text: string }> {
+  const attachment = block.attachment ?? ({} as ImageAttachmentRef)
+  if (attachments !== undefined && typeof attachments.readImage === 'function') {
+    try {
+      const stored = await attachments.readImage(attachment, signal)
+      return serializeImagePart(attachment, stored.data)
+    } catch {
+      return { type: 'input_text', text: '[image omitted: attachment unreadable]' }
+    }
+  }
+  return { type: 'input_text', text: '[image omitted: no attachment service]' }
+}
+
+async function serializeRequest(
   options: GenerateOptions,
   o: AdapterOptions,
   reasoning: ChannelReasoning | undefined,
-): unknown {
+  attachments: AttachmentStore | undefined,
+): Promise<unknown> {
   const input: any[] = []
   let instructions = options.system
 
@@ -97,11 +137,13 @@ function serializeRequest(
       input.push(...calls)
       continue
     }
-    // user：文本 → message；tool-result → function_call_output
-    const textParts: string[] = []
+    // user：文本/图片 → message；tool-result → function_call_output
+    const contentParts: any[] = []
     for (const block of message.content) {
       if (block.type === 'text') {
-        textParts.push(block.text)
+        contentParts.push({ type: 'input_text', text: block.text })
+      } else if (block.type === 'image') {
+        contentParts.push(await serializeUserImage(block, attachments, options.signal))
       } else if (block.type === 'tool-result') {
         input.push({
           type: 'function_call_output',
@@ -110,11 +152,11 @@ function serializeRequest(
         })
       }
     }
-    if (textParts.length > 0) {
+    if (contentParts.length > 0) {
       input.push({
         type: 'message',
         role: 'user',
-        content: textParts.map((t) => ({ type: 'input_text', text: t })),
+        content: contentParts,
       })
     }
   }
@@ -271,7 +313,7 @@ async function* translate(body: ReadableStream<Uint8Array>): AsyncIterable<Strea
         out.push({
           type: 'tool-call-delta',
           index: b.index,
-          id: CallId(b.callId),
+          id: ToolCallId(b.callId),
           ...(b.name !== '' ? { name: b.name } : {}),
           argumentsDelta: frag,
         })
@@ -346,7 +388,7 @@ async function* translate(body: ReadableStream<Uint8Array>): AsyncIterable<Strea
         yield {
           type: 'block-end',
           index: b.index,
-          block: { type: 'tool-call', id: CallId(b.callId), name: b.name, arguments: b.text },
+          block: { type: 'tool-call', id: ToolCallId(b.callId), name: b.name, arguments: b.text },
         }
       }
     }
@@ -390,7 +432,7 @@ export class ChatGptAdapter extends LlmAdapter {
         provider,
         id: m.id,
         name: m.name,
-        inputModalities: ['text'] as const,
+        inputModalities: ['text', 'image'] as const,
       })),
     )
   }
@@ -403,7 +445,7 @@ export class ChatGptAdapter extends LlmAdapter {
       provider,
       id: model,
       name: m?.name ?? model,
-      inputModalities: ['text'],
+      inputModalities: ['text', 'image'],
       context: { contextWindow: m?.contextWindow ?? o.defaultContextWindow },
       defaultMaxTokens: o.maxTokens,
       // 声明思考强度档位 → 模型选择器显示「推理等级」菜单。
@@ -428,7 +470,9 @@ export class ChatGptAdapter extends LlmAdapter {
     const o = this.cfg.options()
     const label = this.cfg.label ?? 'chatgpt'
     const token = await this.cfg.resolveAccessToken()
-    const body = serializeRequest(options, o, this.cfg.reasoning)
+    const attachments =
+      typeof this.cfg.attachments === 'function' ? this.cfg.attachments() : this.cfg.attachments
+    const body = await serializeRequest(options, o, this.cfg.reasoning, attachments)
     const headers: Record<string, string> = {
       authorization: `Bearer ${token.access}`,
       'content-type': 'application/json',

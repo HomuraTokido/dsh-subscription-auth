@@ -60,6 +60,7 @@ export const chatgptChannel: ChannelDefinition = {
         models: ctx.options().models,
         defaultContextWindow: ctx.options().defaultContextWindow,
       }),
+      attachments: ctx.attachments,
       reasoning: REASONING,
       resolveAccessToken: async () => {
         const token = await ctx.readToken()

@@ -12,7 +12,7 @@
  * 同一角色的连续块合并进同一条 message（Anthropic 要求 user/assistant 交替）。
  * @module dsh-subscription-auth/adapters/anthropic
  */
-import { LlmAdapter, LlmError, CallId, ReasoningEffortId, attributionHeaders } from '@deepseek-ai/dsh-llm'
+import { LlmAdapter, LlmError, ToolCallId, ReasoningEffortId, attributionHeaders } from '@deepseek-ai/dsh-llm'
 import type {
   GenerateOptions,
   LlmModelInfo,
@@ -22,6 +22,7 @@ import type {
   ContentBlock,
   TokenUsage,
 } from '@deepseek-ai/dsh-llm'
+import type { AttachmentStore, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import type { AdapterModel } from '../adapter.js'
 import type { ChannelReasoning } from '../channel.js'
 
@@ -41,6 +42,8 @@ export interface AnthropicAdapterConfig {
   resolveAccessToken(): Promise<{ access: string }>
   /** 思考强度档位（缺省不提供）。effort id 映射为 thinking.budget_tokens。 */
   reasoning?: ChannelReasoning
+  /** 附件服务访问器（缺省或返回 undefined 时，图片消息以文字占位符发送）。 */
+  attachments?: () => AttachmentStore | undefined
   /** 错误信息与 providerInfo 里的标签（默认 'anthropic' / 'Claude (订阅)'）。 */
   label?: string
   displayName?: string
@@ -54,11 +57,30 @@ function flattenText(blocks: ContentBlock[]): string {
   return out
 }
 
-function serializeRequest(
+function mergeProviderHeaders(headers: Record<string, string> | undefined): Record<string, string> {
+  const providerHeaders = headers ?? {}
+  const providerNames = new Set(Object.keys(providerHeaders).map((name) => name.toLowerCase()))
+  return {
+    ...Object.fromEntries(
+      Object.entries(attributionHeaders()).filter(([name]) => !providerNames.has(name.toLowerCase())),
+    ),
+    ...providerHeaders,
+  }
+}
+
+function serializeImageBlock(a: ImageAttachmentRef, bytes: Uint8Array): unknown {
+  return {
+    type: 'image',
+    source: { type: 'base64', media_type: a.mediaType, data: Buffer.from(bytes).toString('base64') },
+  }
+}
+
+async function serializeRequest(
   options: GenerateOptions,
   o: AnthropicAdapterOptions,
   reasoning: ChannelReasoning | undefined,
-): unknown {
+  attachments: AttachmentStore | undefined,
+): Promise<unknown> {
   const messages: any[] = []
   let system = options.system
 
@@ -95,6 +117,18 @@ function serializeRequest(
     for (const block of message.content) {
       if (block.type === 'text') {
         push('user', { type: 'text', text: block.text })
+      } else if (block.type === 'image') {
+        const a = block.attachment ?? ({} as ImageAttachmentRef)
+        if (attachments !== undefined && typeof attachments.readImage === 'function') {
+          try {
+            const stored = await attachments.readImage(a, options.signal)
+            push('user', serializeImageBlock(a, stored.data))
+          } catch {
+            push('user', { type: 'text', text: '[image omitted: attachment unreadable]' })
+          }
+        } else {
+          push('user', { type: 'text', text: '[image omitted: no attachment service]' })
+        }
       } else if (block.type === 'tool-result') {
         push('user', {
           type: 'tool_result',
@@ -142,7 +176,7 @@ function httpErrorCode(status: number): string {
 function mapUsage(usage: any): TokenUsage {
   const cacheRead = usage?.cache_read_input_tokens
   return {
-    inputTokens: (usage?.input_tokens ?? 0) - (cacheRead ?? 0),
+    inputTokens: usage?.input_tokens ?? 0,
     outputTokens: usage?.output_tokens ?? 0,
     ...(cacheRead !== undefined ? { cacheReadTokens: cacheRead } : {}),
   }
@@ -239,7 +273,7 @@ async function* translate(
           out.push({
             type: 'tool-call-delta',
             index: tool.index,
-            id: CallId(tool.callId),
+            id: ToolCallId(tool.callId),
             ...(tool.name !== '' ? { name: tool.name } : {}),
             argumentsDelta: frag,
           })
@@ -317,7 +351,7 @@ async function* translate(
         yield {
           type: 'block-end',
           index: b.index,
-          block: { type: 'tool-call', id: CallId(b.callId), name: b.name, arguments: b.text },
+          block: { type: 'tool-call', id: ToolCallId(b.callId), name: b.name, arguments: b.text },
         }
       }
     }
@@ -359,7 +393,7 @@ export class AnthropicMessagesAdapter extends LlmAdapter {
         provider,
         id: m.id,
         name: m.name,
-        inputModalities: ['text'] as const,
+        inputModalities: ['text', 'image'] as const,
       })),
     )
   }
@@ -372,7 +406,7 @@ export class AnthropicMessagesAdapter extends LlmAdapter {
       provider,
       id: model,
       name: m?.name ?? model,
-      inputModalities: ['text'],
+      inputModalities: ['text', 'image'],
       context: { contextWindow: m?.contextWindow ?? o.defaultContextWindow },
       defaultMaxTokens: o.maxTokens,
       // 声明思考强度档位 → 模型选择器显示「推理等级」菜单。
@@ -397,13 +431,12 @@ export class AnthropicMessagesAdapter extends LlmAdapter {
     const o = this.cfg.options()
     const label = this.cfg.label ?? 'anthropic'
     const token = await this.cfg.resolveAccessToken()
-    const body = serializeRequest(options, o, this.cfg.reasoning)
+    const body = await serializeRequest(options, o, this.cfg.reasoning, this.cfg.attachments?.())
     const headers: Record<string, string> = {
       authorization: `Bearer ${token.access}`,
       'content-type': 'application/json',
       accept: 'text/event-stream',
-      ...(o.headers ? o.headers() : {}),
-      ...attributionHeaders(),
+      ...mergeProviderHeaders(o.headers ? o.headers() : {}),
     }
 
     let response: Response

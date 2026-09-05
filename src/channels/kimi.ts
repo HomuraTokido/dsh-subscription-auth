@@ -46,7 +46,8 @@ function kimiCommonHeaders(): Record<string, string> {
     deviceId = randomUUID().replace(/-/g, '')
   }
   return {
-    'User-Agent': 'KimiCLI/1.0',
+    'User-Agent': 'KimiCLI/1.5',
+    'anthropic-version': '2023-06-01',
     'X-Msh-Platform': 'kimi_cli',
     'X-Msh-Version': '1.0',
     'X-Msh-Device-Name': os.hostname(),
@@ -204,6 +205,7 @@ export const kimiChannel: ChannelDefinition = {
         defaultContextWindow: ctx.options().defaultContextWindow,
         headers: () => kimiCommonHeaders(),
       }),
+      attachments: ctx.attachments,
       reasoning: REASONING,
       resolveAccessToken: async () => {
         const token = await ctx.readToken()

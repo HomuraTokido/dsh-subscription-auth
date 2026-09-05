@@ -18,7 +18,11 @@ import type { Context as CordisContext } from '@deepseek-ai/cordis'
 import type LlmRuntime from '@deepseek-ai/dsh-llm'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { CredentialProvider } from '@deepseek-ai/dsh-credentials'
-import { settingsNamespace } from '@deepseek-ai/dsh-settings'
+// 只保留类型侧引用：dsh-settings 用 declare module 给 cordis 的 Context 增强出
+// settings 字段，下面 settingsCtx.settings.register(...) 依赖它。补丁在 JS 层
+// 删掉了这行的值导入（settingsNamespace 已不再由该包导出），而 import type {}
+// 不产生任何运行时导入，转译后与补丁产物完全一致。
+import type {} from '@deepseek-ai/dsh-settings'
 import type { AdapterModel } from './adapter.js'
 import type {
   ChannelConfig,
@@ -41,7 +45,7 @@ export const name = 'dsh-subscription-auth'
 export const inject = ['llm']
 
 /** settings 命名空间必须匹配 /^[a-z][a-z0-9-]*$/（单段、无点）。 */
-const channelNamespace = (id: string) => settingsNamespace(`subscription-auth-${id}`)
+const channelNamespace = (id: string) => `subscription-auth-${id}`
 
 /** 所有订阅渠道（顺序即「订阅服务」页卡片顺序）。 */
 export const CHANNELS: ChannelDefinition[] = [
@@ -129,6 +133,7 @@ interface ChannelState {
 export function apply(ctx: Context, config: Record<string, unknown> = {}): void {
   const states = new Map<string, ChannelState>()
   const credentials = () => ctx.get('credentials') as CredentialProvider | undefined
+  const attachments = () => ctx.get('attachments')
   /** 插件卸载后停止启动门控轮询。 */
   const gateStopped = new Map<string, boolean>()
 
@@ -178,6 +183,7 @@ export function apply(ctx: Context, config: Record<string, unknown> = {}): void 
         if (s !== undefined) await s.update(patch)
       },
       credentials,
+      attachments,
       log: logLine,
       notifyModelsChanged: () => {
         try {
