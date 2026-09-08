@@ -83,6 +83,7 @@ function makeConfigSchema(def: ChannelDefinition) {
     models: z.array(catalogModel),
     defaultContextWindow: z.number().default(def.defaultContextWindow),
     maxTokens: z.number().default(def.defaultMaxTokens),
+    clientVersion: z.string(),
     discoveredModels: z.array(catalogModel),
   })
 }
@@ -98,6 +99,7 @@ function resolveOptions(
   models: AdapterModel[]
   defaultContextWindow: number
   maxTokens: number
+  clientVersion?: string
 } {
   const source = (raw.models !== undefined && raw.models.length > 0)
     ? raw.models
@@ -115,6 +117,9 @@ function resolveOptions(
     models,
     defaultContextWindow: raw.defaultContextWindow ?? def.defaultContextWindow,
     maxTokens: raw.maxTokens ?? def.defaultMaxTokens,
+    ...(raw.clientVersion !== undefined && raw.clientVersion.trim() !== ''
+      ? { clientVersion: raw.clientVersion.trim() }
+      : {}),
   }
 }
 

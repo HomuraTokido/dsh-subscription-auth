@@ -44,6 +44,8 @@ export interface ChannelConfig {
   models?: AdapterModel[]
   defaultContextWindow?: number
   maxTokens?: number
+  /** 模型发现请求携带的客户端版本号；后端按它决定发哪些模型。不配则用渠道默认值。 */
+  clientVersion?: string
   /** 登录后自动发现并持久化的官方模型列表（内部字段，不在配置 UI 展示）。 */
   discoveredModels?: AdapterModel[]
 }
@@ -54,6 +56,7 @@ export interface ResolvedChannelOptions {
   models: AdapterModel[]
   defaultContextWindow: number
   maxTokens: number
+  clientVersion?: string
 }
 
 export interface LoginResult {

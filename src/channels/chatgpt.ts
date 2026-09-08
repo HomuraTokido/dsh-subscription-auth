@@ -141,6 +141,8 @@ export const chatgptChannel: ChannelDefinition = {
             token.access,
             token.accountId,
             ctx.options().apiBaseURL.replace(/\/codex\/responses$/, ''),
+            undefined,
+            ctx.options().clientVersion,
           )
         } catch (error) {
           ctx.log(`模型列表发现失败: ${error?.message ?? error}`)

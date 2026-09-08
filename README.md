@@ -149,6 +149,15 @@ subscription-auth-kimi:
   maxTokens: 32768
 ```
 
+ChatGPT 渠道另有 `clientVersion`：模型发现请求携带的 codex 客户端版本号，后端按它决定
+发哪些模型（老版本号看不到新模型）。默认值跟随代码里的 `CLIENT_VERSION`；本机 Codex
+更新后新模型没出现时，把它设成本机 `codex --version` 的值，重新登录或重启即可：
+
+```yaml
+subscription-auth-chatgpt:
+  clientVersion: "0.153.4"
+```
+
 `models` 可手动固定模型列表（可选；不配则用登录后自动发现的官方列表），例如：
 
 ```yaml

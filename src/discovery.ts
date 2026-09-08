@@ -13,8 +13,14 @@
 import type { AdapterModel } from './adapter.js'
 
 export const CODEX_BASE_URL = 'https://chatgpt.com/backend-api'
-/** 与 omp 一致的 codex 客户端版本（对应 @openai/codex 版本）。 */
-export const CLIENT_VERSION = '0.144.1'
+/**
+ * 发现请求默认携带的 codex 客户端版本（对应 @openai/codex 版本）。
+ *
+ * 后端按这个版本号决定发哪些模型：0.144.1 拿不到 gpt-6-astra，0.153.4 才有
+ * （2026-09-08 同一账号实测）。所以它不能是常量：渠道配置 `clientVersion`
+ * 可以覆盖，这里只是默认值，跟着本机 Codex 的版本走即可。
+ */
+export const CLIENT_VERSION = '0.153.4'
 
 const MODEL_PATHS = ['/codex/models', '/models'] as const
 
@@ -27,13 +33,15 @@ export async function fetchCodexModels(
   accountId: string | undefined,
   baseUrl?: string,
   signal?: AbortSignal,
+  clientVersion?: string,
 ): Promise<AdapterModel[]> {
   const base = (baseUrl ?? CODEX_BASE_URL).trim().replace(/\/+$/, '')
+  const version = clientVersion !== undefined && clientVersion.trim() !== '' ? clientVersion.trim() : CLIENT_VERSION
   const headers: Record<string, string> = {
     Authorization: `Bearer ${accessToken}`,
     'OpenAI-Beta': 'responses=experimental',
     originator: 'pi',
-    version: CLIENT_VERSION,
+    version,
     accept: 'application/json',
   }
   if (accountId !== undefined && accountId.trim() !== '') {
@@ -41,7 +49,7 @@ export async function fetchCodexModels(
   }
 
   for (const path of MODEL_PATHS) {
-    const url = `${base}${path}?client_version=${encodeURIComponent(CLIENT_VERSION)}`
+    const url = `${base}${path}?client_version=${encodeURIComponent(version)}`
     let response: Response
     try {
       response = await fetch(url, { method: 'GET', headers, signal })
