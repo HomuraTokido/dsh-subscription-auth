@@ -1,10 +1,11 @@
 /**
  * apply() 接线测试（node 直接跑，替代 bun smoke 的 section 6）：
  * 验证 provider/adapter 注册、按登录状态门控（未登录不注册）、settings
- * 命名空间注册、webServer 路由注册。
+ * 命名空间注册、Typert Gateway Remote 服务注册。
  * 运行：node tests/apply-wiring.mjs
  */
 import assert from 'node:assert'
+import { remoteMethods } from '@deepseek-ai/dsh-typert-protocol'
 
 const plugin = await import('../lib/index.js')
 assert.equal(plugin.name, 'dsh-subscription-auth')
@@ -23,8 +24,7 @@ function freshHarness(tokens = {}, credReadyAt = 0) {
     adapters: [],
     providerReplaces: [],
     adapterReplaces: [],
-    routes: [],
-    routeHandlers: {},
+    plugins: [],
     namespaces: [],
     effects: [],
     disposers: 0,
@@ -66,6 +66,10 @@ function freshHarness(tokens = {}, credReadyAt = 0) {
           },
         },
       })
+    },
+    plugin: (p) => {
+      calls.plugins.push(p)
+      return () => {}
     },
     effect: (cb, label) => {
       calls.effects.push(label)
@@ -180,16 +184,14 @@ const waitSettle = () => new Promise((r) => setTimeout(r, 60))
   console.log('✓ D. credentials 晚就绪（启动竞态）：门控轮询等待，chatgpt 不被误撤销')
 }
 
-// ============ 接线基础断言（路由 / settings / effect） ============
+// ============ 接线基础断言（Remote 服务 / settings / effect） ============
 {
   const { calls, mockCtx } = freshHarness()
   plugin.apply(mockCtx)
+  // apply 用动态 import() 挂 Remote 服务：等一轮宏任务让它落地。
+  await new Promise((resolve) => setTimeout(resolve, 0))
 
-  assert.deepEqual(
-    calls.routes.sort(),
-    ['/subscription-auth/auth/login', '/subscription-auth/auth/logout', '/subscription-auth/providers'],
-    '3 条路由已注册',
-  )
+  assert.equal(calls.plugins.length, 1, 'Remote 服务类已通过 ctx.plugin 注册')
   assert.deepEqual(
     calls.namespaces.sort(),
     ['subscription-auth-chatgpt', 'subscription-auth-claude', 'subscription-auth-grok', 'subscription-auth-kimi'],
@@ -197,37 +199,26 @@ const waitSettle = () => new Promise((r) => setTimeout(r, 60))
   )
   assert.ok(calls.effects.length >= 2, `effect 已注册 (${calls.effects.join(', ')})`)
 
-  // 路由 handler 冒烟：providers GET 应返回 4 个渠道卡片（未登录状态）
-  const providerHandler = calls.routeHandlers['/subscription-auth/providers']
-  assert.ok(typeof providerHandler === 'function', 'providers 路由 handler 存在')
-  const req = { method: 'GET' }
-  let resBody = ''
-  const res = {
-    writeHead: (code, headers) => {
-      res.status = code
-      res.headers = headers
-    },
-    end: (body) => {
-      resBody = body
-    },
-  }
-  await providerHandler(req, res)
-  assert.equal(res.status, 200, 'providers 返回 200')
-  const payload = JSON.parse(resBody)
+  // Remote 服务：namespace 就是 wire 前缀，三个方法都要带 @Remote 标记。
+  const RemoteClass = calls.plugins[0]
+  const instance = new RemoteClass({ reflect: { provide: () => {} } })
+  assert.equal(instance.typertRemote.namespace, 'subscriptionAuth', 'wire namespace = subscriptionAuth')
+  assert.deepEqual(
+    remoteMethods(instance).map((m) => m.method).sort(),
+    ['login', 'logout', 'providers'],
+    '三个 Remote 端点已标记（gateway 靠它拼 subscriptionAuth/<方法名>）',
+  )
+
+  // 端点冒烟：providers 返回 4 个渠道卡片（未登录状态）
+  const payload = await instance.providers()
   assert.equal(payload.providers.length, 4, 'providers 返回 4 个渠道')
   assert.deepEqual(payload.providers.map((p) => p.id).sort(), ['chatgpt', 'claude', 'grok', 'kimi'])
   assert.ok(payload.providers.every((p) => p.status === 'not-logged-in'), '未登录状态')
 
-  // 未知 provider 应 404
-  const loginHandler = calls.routeHandlers['/subscription-auth/auth/login']
-  let badStatus = 0
-  await loginHandler(
-    { method: 'POST', [Symbol.asyncIterator]: (async function* () { yield '{"provider":"nope"}' })() },
-    { writeHead: (code) => { badStatus = code }, end: () => {} },
-  )
-  assert.equal(badStatus, 404, '未知 provider 返回 404')
+  // 未知 provider 抛错（gateway 会把它包成 failure 信封）
+  await assert.rejects(() => instance.login('nope'), /unknown provider: nope/, '未知 provider 抛错')
 
-  console.log('✓ C. 接线基础：3 路由 + 4 settings 命名空间；providers 返回 4 卡片（含未登录态），未知 provider 404')
+  console.log('✓ C. 接线基础：Remote namespace subscriptionAuth + 3 端点 + 4 settings 命名空间；providers 返回 4 卡片（含未登录态），未知 provider 抛错')
 }
 
 console.log('✓ apply() 接线测试全部通过')

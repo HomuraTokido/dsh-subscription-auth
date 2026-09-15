@@ -7,10 +7,9 @@
  * 的登录/注销/状态路由。每个渠道的 OAuth 流程、模型发现与适配器都封装在
  * src/channels/<id>.ts 里（见 src/channel.ts 的 ChannelDefinition 契约）。
  *
- * 登录入口在配置中心的「订阅服务」页（client half）：
- *   GET  /subscription-auth/providers   所有渠道的目录 + 登录状态
- *   POST /subscription-auth/auth/login  启动 OAuth（body: { provider }）
- *   POST /subscription-auth/auth/logout 注销（body: { provider }）
+ * 登录入口在配置中心的「订阅服务」页（client half）：三条端点
+ * providers / login / logout 挂在 Typert Gateway 的 /api 通道上（见 src/remote.ts，
+ * 官方 Electron 壳没有 webserver，HTTP 路由挂不上）。
  * @module dsh-subscription-auth
  */
 import z from '@deepseek-ai/schemastery'
@@ -35,6 +34,9 @@ import { chatgptChannel } from './channels/chatgpt.js'
 import { claudeChannel } from './channels/claude.js'
 import { grokChannel } from './channels/grok.js'
 import { kimiChannel } from './channels/kimi.js'
+// 只引类型：运行时通过动态 import() 加载 ./remote.js，避免静态依赖协议包
+// （终端型 profile 没有 gateway 时也要能加载本插件）。
+import type { SubscriptionAuthRemoteDeps } from './remote.js'
 import { appendFileSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import os from 'node:os'
@@ -339,121 +341,63 @@ export function apply(ctx: Context, config: Record<string, unknown> = {}): void 
     for (const st of states.values()) st.runtime.cancelLogin()
   }, 'subscription-auth.auth-cleanup')
 
-  // ---------- 配置中心页面用的 HTTP 路由 ----------
-  ctx.inject(['webServer'], (webCtx) => {
-    const webServer = webCtx.webServer
-    const collectBody = async (req: unknown): Promise<string> => {
-      const chunks: Buffer[] = []
-      for await (const chunk of req as AsyncIterable<Buffer>) chunks.push(chunk)
-      return Buffer.concat(chunks).toString('utf8')
+  // ---------- 配置中心「订阅服务」页的 RPC 端点（Typert Gateway 的 /api 通道）----------
+  // 不再挂 webServer 路由：官方 Electron 壳的组合补丁把 webserver 行 disabled
+  // （apps/desktop-host/config/desktop.cordis.patch.yml），缺服务时注册不成立，
+  // 页面的 fetch 只落到静态处理的 SPA 回退拿到 index.html。gateway 的 /api
+  // interceptor 是官方壳唯一通行、legacy 壳同样具备的通道（见 src/remote.ts）。
+  const channelCard = async (st: ChannelState): Promise<Record<string, unknown>> => {
+    const state = await st.runtime.authStatus()
+    // 已登录但还没有发现结果（例如升级插件后已登录的存量会话）：顺手触发一次。
+    if (state.status === 'logged-in' && st.discovered === undefined) {
+      void discoverAndStore(st)
     }
-    const send = (
-      res: { writeHead(code: number, headers: Record<string, string>): void; end(body: string): void },
-      code: number,
-      payload: unknown,
-    ): void => {
-      const body = JSON.stringify(payload)
-      res.writeHead(code, {
-        'content-type': 'application/json; charset=utf-8',
-        'cache-control': 'no-store',
+    const models = resolveOptions(st.channelCtx.getConfig(), st.discovered?.models, st.def)
+      .models.map((m) => m.id)
+    return {
+      id: st.def.id,
+      name: st.def.name,
+      description: st.def.description,
+      models,
+      ...(st.discovered !== undefined ? { discoveredAt: st.discovered.at } : {}),
+      ...state,
+    }
+  }
+
+  const remoteDeps: SubscriptionAuthRemoteDeps = {
+    providers: async () => {
+      const providers: Record<string, unknown>[] = []
+      for (const def of CHANNELS) providers.push(await channelCard(states.get(def.id)!))
+      return providers
+    },
+    login: async (provider) => {
+      const st = states.get(provider)
+      // 抛错由 gateway 包成 failure 信封，客户端按 error.message 显示。
+      if (st === undefined) throw new Error(`unknown provider: ${provider}`)
+      return await st.runtime.login()
+    },
+    logout: async (provider) => {
+      const st = states.get(provider)
+      if (st === undefined) throw new Error(`unknown provider: ${provider}`)
+      await logoutChannel(st)
+      return { ok: true }
+    },
+  }
+
+  // 与 plugins/dsh-update-watch 同形：动态 import 让协议包只在真正挂载时才解析，
+  // 终端型 profile（没有 gateway）不会因此加载失败；协议包不在场时只降级为
+  // 「页面读不到列表」，不影响已登录渠道的 provider/adapter 注册。
+  ctx.effect(() => {
+    let disposed = false
+    void import('./remote.js')
+      .then(({ createSubscriptionAuthRemote }) => {
+        if (!disposed) ctx.plugin(createSubscriptionAuthRemote(remoteDeps))
       })
-      res.end(body)
+      .catch((error: unknown) => {
+        logLine(`订阅服务 RPC 端点未挂载: ${error instanceof Error ? error.message : String(error)}`)
+      })
+    return () => {
+      disposed = true
     }
-
-    const channelCard = async (st: ChannelState): Promise<Record<string, unknown>> => {
-      const state = await st.runtime.authStatus()
-      // 已登录但还没有发现结果（例如升级插件后已登录的存量会话）：顺手触发一次。
-      if (state.status === 'logged-in' && st.discovered === undefined) {
-        void discoverAndStore(st)
-      }
-      const models = resolveOptions(st.channelCtx.getConfig(), st.discovered?.models, st.def)
-        .models.map((m) => m.id)
-      return {
-        id: st.def.id,
-        name: st.def.name,
-        description: st.def.description,
-        models,
-        ...(st.discovered !== undefined ? { discoveredAt: st.discovered.at } : {}),
-        ...state,
-      }
-    }
-
-    webCtx.effect(() => webServer.register({
-      kind: 'exact',
-      path: '/subscription-auth/providers',
-      handler: async (req, res) => {
-        try {
-          if (req.method !== 'GET') {
-            send(res, 405, { error: 'method not allowed' })
-            return
-          }
-          const providers: Record<string, unknown>[] = []
-          for (const def of CHANNELS) {
-            providers.push(await channelCard(states.get(def.id)!))
-          }
-          send(res, 200, { providers })
-        } catch (error) {
-          send(res, 500, { error: error instanceof Error ? error.message : String(error) })
-        }
-      },
-    }), 'subscription-auth.providers-route')
-
-    webCtx.effect(() => webServer.register({
-      kind: 'exact',
-      path: '/subscription-auth/auth/login',
-      handler: async (req, res) => {
-        try {
-          if (req.method !== 'POST') {
-            send(res, 405, { error: 'method not allowed' })
-            return
-          }
-          let body: Record<string, unknown> = {}
-          try {
-            body = JSON.parse((await collectBody(req)) || '{}')
-          } catch {
-            /* 无 body 时按空处理 */
-          }
-          const id = typeof body.provider === 'string' ? body.provider : ''
-          const st = states.get(id)
-          if (st === undefined) {
-            send(res, 404, { error: `unknown provider: ${id}` })
-            return
-          }
-          const result = await st.runtime.login()
-          send(res, 200, result)
-        } catch (error) {
-          send(res, 500, { error: error instanceof Error ? error.message : String(error) })
-        }
-      },
-    }), 'subscription-auth.login-route')
-
-    webCtx.effect(() => webServer.register({
-      kind: 'exact',
-      path: '/subscription-auth/auth/logout',
-      handler: async (req, res) => {
-        try {
-          if (req.method !== 'POST') {
-            send(res, 405, { error: 'method not allowed' })
-            return
-          }
-          let body: Record<string, unknown> = {}
-          try {
-            body = JSON.parse((await collectBody(req)) || '{}')
-          } catch {
-            /* 无 body 时按空处理 */
-          }
-          const id = typeof body.provider === 'string' ? body.provider : ''
-          const st = states.get(id)
-          if (st === undefined) {
-            send(res, 404, { error: `unknown provider: ${id}` })
-            return
-          }
-          await logoutChannel(st)
-          send(res, 200, { ok: true })
-        } catch (error) {
-          send(res, 500, { error: error instanceof Error ? error.message : String(error) })
-        }
-      },
-    }), 'subscription-auth.logout-route')
-  })
+  }, 'subscription-auth: settings remote')
 }
