@@ -79,6 +79,12 @@
   并新增 `@deepseek-ai/dsh-attachment`（图片支持所需，上游 JS 实现靠鸭子类型
   规避了这条依赖声明）。该 peer 标记为 optional：图片序列化在宿主未注册附件
   服务时退化为文本占位，插件本身不依赖它才能启动。
+- **2026-09-29：四个 peer 放宽为 `^0.1.0-rc.5 || ^0.2.0-rc.1`**（dsh-llm、dsh-credentials、
+  dsh-settings、dsh-attachment）。core 0.1.7 起宿主会逐个核对插件的 `@deepseek-ai/dsh-*`
+  peer，`^0.1.x` 覆盖不到 0.2.0-rc.1，插件会被整个跳过。依据：这四个包（加上本插件
+  实际用到的 dsh-typert-protocol）的 `src` 在 `dsh-v0.1.7-rc.2` 与 `dsh-v0.2.0-rc.1`
+  两个 tag 之间零差异，只有 package.json 的版本号变了；代码没有改。升 core 时核对：
+  这几个包的公开接口有没有动，动了就不能只改范围。
 
 ### 工程改动
 
