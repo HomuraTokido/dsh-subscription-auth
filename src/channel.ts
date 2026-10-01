@@ -36,7 +36,7 @@ export interface StoredToken {
   [key: string]: unknown
 }
 
-/** 渠道在 settings 里持久化的配置（`subscription-auth-<id>` 命名空间）。 */
+/** 渠道的配置：插件 Config 里的 `<id>` 段（volatile，经 configEditor 写回 profile）。 */
 export interface ChannelConfig {
   apiBaseURL?: string
   redirectPort?: number
@@ -44,9 +44,9 @@ export interface ChannelConfig {
   models?: AdapterModel[]
   defaultContextWindow?: number
   maxTokens?: number
-  /** 模型发现请求携带的客户端版本号；后端按它决定发哪些模型。不配则用渠道默认值。 */
+  /** 模型发现请求携带的客户端版本号；后端按它决定发哪些模型。不配则每次去 npm 查 codex 最新版。 */
   clientVersion?: string
-  /** 登录后自动发现并持久化的官方模型列表（内部字段，不在配置 UI 展示）。 */
+  /** 登录后自动发现并持久化的官方模型列表（插件自己写，手改会被下次发现覆盖）。 */
   discoveredModels?: AdapterModel[]
 }
 

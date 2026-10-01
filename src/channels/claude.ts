@@ -148,6 +148,16 @@ export const claudeChannel: ChannelDefinition = {
     let controller: AbortController | undefined
     let pending: { url: string } | undefined
 
+    /** 读令牌，快过期就先刷新并写回；未登录返回 undefined。对话请求和模型发现共用。 */
+    const freshToken = async () => {
+      const token = await ctx.readToken()
+      if (!token) return undefined
+      if (token.expires - Date.now() >= RESOLVE_THRESHOLD_MS) return token
+      const refreshed = await refreshClaudeToken(token.refresh)
+      await ctx.writeToken(refreshed)
+      return refreshed
+    }
+
     const adapter = new AnthropicMessagesAdapter({
       options: () => ({
         apiBaseURL: ctx.options().apiBaseURL,
@@ -162,14 +172,9 @@ export const claudeChannel: ChannelDefinition = {
       attachments: ctx.attachments,
       reasoning: REASONING,
       resolveAccessToken: async () => {
-        const token = await ctx.readToken()
+        const token = await freshToken()
         if (!token) {
           throw new LlmError('claude: 未登录。请在 设置 → 订阅服务 里完成订阅账号授权。', 'MISSING_CREDENTIAL')
-        }
-        if (token.expires - Date.now() < RESOLVE_THRESHOLD_MS) {
-          const refreshed = await refreshClaudeToken(token.refresh)
-          await ctx.writeToken(refreshed)
-          return { access: refreshed.access }
         }
         return { access: token.access }
       },
@@ -233,9 +238,9 @@ export const claudeChannel: ChannelDefinition = {
       },
 
       async discoverModels() {
-        const token = await ctx.readToken()
-        if (!token || token.expires - Date.now() < RESOLVE_THRESHOLD_MS) return []
         try {
+          const token = await freshToken()
+          if (!token) return []
           return await fetchClaudeModels(token.access)
         } catch (error) {
           ctx.log('模型列表发现失败: ' + (error?.message ?? error))

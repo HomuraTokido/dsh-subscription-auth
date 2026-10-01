@@ -209,6 +209,16 @@ export const grokChannel: ChannelDefinition = {
     let controller: AbortController | undefined
     let pending: { url: string; userCode: string } | undefined
 
+    /** 读令牌，快过期就先刷新并写回；未登录返回 undefined。对话请求和模型发现共用。 */
+    const freshToken = async () => {
+      const token = await ctx.readToken()
+      if (!token) return undefined
+      if (token.expires - Date.now() >= 60_000) return token
+      const refreshed = { ...token, ...await refreshToken(token.refresh) }
+      await ctx.writeToken(refreshed)
+      return refreshed
+    }
+
     const adapter = new ChatGptAdapter({
       options: () => ({
         apiBaseURL: ctx.options().apiBaseURL,
@@ -219,14 +229,9 @@ export const grokChannel: ChannelDefinition = {
       attachments: ctx.attachments,
       reasoning: REASONING,
       resolveAccessToken: async () => {
-        const token = await ctx.readToken()
+        const token = await freshToken()
         if (!token) {
           throw new LlmError('grok: 未登录。请在 设置 → 订阅服务 里完成订阅账号授权。', 'MISSING_CREDENTIAL')
-        }
-        if (token.expires - Date.now() < 60_000) {
-          const refreshed = await refreshToken(token.refresh)
-          await ctx.writeToken({ ...token, ...refreshed })
-          return { access: refreshed.access }
         }
         return { access: token.access }
       },
@@ -308,9 +313,9 @@ export const grokChannel: ChannelDefinition = {
       },
 
       async discoverModels() {
-        const token = await ctx.readToken()
-        if (!token || token.expires - Date.now() < 60_000) return []
         try {
+          const token = await freshToken()
+          if (!token) return []
           return await fetchGrokModels(token.access)
         } catch (error: any) {
           ctx.log(`模型列表发现失败: ${error?.message ?? error}`)

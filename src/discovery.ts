@@ -14,13 +14,45 @@ import type { AdapterModel } from './adapter.js'
 
 export const CODEX_BASE_URL = 'https://chatgpt.com/backend-api'
 /**
- * 发现请求默认携带的 codex 客户端版本（对应 @openai/codex 版本）。
+ * codex 客户端版本的最后兜底（对应 @openai/codex 版本）。
  *
  * 后端按这个版本号决定发哪些模型：0.144.1 拿不到 gpt-6-astra，0.153.4 才有
- * （2026-09-08 同一账号实测）。所以它不能是常量：渠道配置 `clientVersion`
- * 可以覆盖，这里只是默认值，跟着本机 Codex 的版本走即可。
+ * （2026-09-08 同一账号实测）；0.153.4 拿不到 gpt-6.1-sol / gpt-6-sol /
+ * gpt-6-luna，0.159.3 才有（2026-10-01 实测）。所以平时不用它：
+ * resolveCodexClientVersion() 每次发现前去 npm 查 @openai/codex 的最新版，
+ * 查不到才退回上次查到的版本，再退回这里。渠道配置 `clientVersion` 优先于这一切。
  */
-export const CLIENT_VERSION = '0.153.4'
+export const CLIENT_VERSION = '0.159.3'
+
+const CODEX_LATEST_URL = 'https://registry.npmjs.org/@openai/codex/latest'
+const VERSION_TTL_MS = 6 * 60 * 60 * 1000
+let cachedVersion: { version: string; at: number } | undefined
+
+/**
+ * 当前 codex CLI 的最新版本号，供模型发现请求携带。
+ * 6 小时内复用上次结果；npm 查询失败时退回上次查到的版本，再退回 CLIENT_VERSION。
+ * 不抛错：版本号拿不到不该挡住模型发现。
+ */
+export async function resolveCodexClientVersion(log?: (message: string) => void): Promise<string> {
+  if (cachedVersion !== undefined && Date.now() - cachedVersion.at < VERSION_TTL_MS) return cachedVersion.version
+  try {
+    const response = await fetch(CODEX_LATEST_URL, {
+      headers: { accept: 'application/json' },
+      signal: AbortSignal.timeout(8000),
+    })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const version = (await response.json() as { version?: unknown }).version
+    if (typeof version !== 'string' || !/^\d+\.\d+\.\d+$/.test(version)) {
+      throw new Error(`返回的版本号不像 x.y.z：${String(version)}`)
+    }
+    cachedVersion = { version, at: Date.now() }
+    return version
+  } catch (error) {
+    const fallback = cachedVersion?.version ?? CLIENT_VERSION
+    log?.(`查 @openai/codex 最新版本失败（${(error as Error)?.message ?? error}），这次用 ${fallback} 发现模型；新模型可能缺几个，下次发现会再查`)
+    return fallback
+  }
+}
 
 const MODEL_PATHS = ['/codex/models', '/models'] as const
 

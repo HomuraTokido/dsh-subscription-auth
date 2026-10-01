@@ -1,7 +1,7 @@
 /**
  * apply() 接线测试（node 直接跑，替代 bun smoke 的 section 6）：
- * 验证 provider/adapter 注册、按登录状态门控（未登录不注册）、settings
- * 命名空间注册、Typert Gateway Remote 服务注册。
+ * 验证 provider/adapter 注册、按登录状态门控（未登录不注册）、每渠道一段
+ * volatile Config、Typert Gateway Remote 服务注册，以及过期令牌下的模型发现。
  * 运行：node tests/apply-wiring.mjs
  */
 import assert from 'node:assert'
@@ -25,9 +25,17 @@ function freshHarness(tokens = {}, credReadyAt = 0) {
     providerReplaces: [],
     adapterReplaces: [],
     plugins: [],
-    namespaces: [],
     effects: [],
     disposers: 0,
+    /** configEditor 写进条目的最新 raw 配置。 */
+    savedConfig: undefined,
+  }
+  const entry = { options: { id: 'dsh-subscription-auth' } }
+  const configEditor = {
+    edit: async (target, change) => {
+      assert.equal(target, entry, 'configEditor.edit 编辑的是本插件自己的条目')
+      calls.savedConfig = change(calls.savedConfig)
+    },
   }
   const disposers = []
   let credReady = credReadyAt <= 0
@@ -41,7 +49,12 @@ function freshHarness(tokens = {}, credReadyAt = 0) {
     unset: async () => {},
   }
   const mockCtx = {
-    get: (name) => (name === 'credentials' && credReady ? mockCred : undefined),
+    fiber: { entry },
+    get: (name) => {
+      if (name === 'credentials') return credReady ? mockCred : undefined
+      if (name === 'configEditor') return configEditor
+      return undefined
+    },
     inject: (deps, fn) => {
       fn({
         effect: (cb, label) => {
@@ -51,12 +64,6 @@ function freshHarness(tokens = {}, credReadyAt = 0) {
             disposers.push(d)
             calls.disposers++
           }
-        },
-        settings: {
-          register: (ns, schema, opts) => {
-            calls.namespaces.push(ns)
-            return { get: () => ({}), update: async () => {} }
-          },
         },
         webServer: {
           register: (desc) => {
@@ -192,12 +199,16 @@ const waitSettle = () => new Promise((r) => setTimeout(r, 60))
   await new Promise((resolve) => setTimeout(resolve, 0))
 
   assert.equal(calls.plugins.length, 1, 'Remote 服务类已通过 ctx.plugin 注册')
-  assert.deepEqual(
-    calls.namespaces.sort(),
-    ['subscription-auth-chatgpt', 'subscription-auth-claude', 'subscription-auth-grok', 'subscription-auth-kimi'],
-    '4 个 settings 命名空间已注册',
+  // core 0.2 的 settings 只编辑插件 Config 里的 volatile 字段：每个渠道一段，空配置也能解析成引用。
+  const parsed = plugin.Config({})
+  assert.deepEqual(Object.keys(parsed).sort(), ['chatgpt', 'claude', 'grok', 'kimi'], 'Config 每个渠道一段')
+  assert.ok(Object.values(parsed).every((ref) => typeof ref.get === 'function'), '每段都是 volatile 引用')
+  assert.equal(parsed.chatgpt.get().apiBaseURL, 'https://chatgpt.com/backend-api/codex/responses', 'chatgpt 段带默认值')
+  assert.ok(
+    calls.providers.every((p) => p.settingsNs === 'dsh-subscription-auth' && p.settingsPath[0] === p.provider),
+    'provider 的设置链接指向本插件条目下的渠道段',
   )
-  assert.ok(calls.effects.length >= 2, `effect 已注册 (${calls.effects.join(', ')})`)
+  assert.ok(calls.effects.length >= 1, `effect 已注册 (${calls.effects.join(', ')})`)
 
   // Remote 服务：namespace 就是 wire 前缀，三个方法都要带 @Remote 标记。
   const RemoteClass = calls.plugins[0]
@@ -218,7 +229,46 @@ const waitSettle = () => new Promise((r) => setTimeout(r, 60))
   // 未知 provider 抛错（gateway 会把它包成 failure 信封）
   await assert.rejects(() => instance.login('nope'), /unknown provider: nope/, '未知 provider 抛错')
 
-  console.log('✓ C. 接线基础：Remote namespace subscriptionAuth + 3 端点 + 4 settings 命名空间；providers 返回 4 卡片（含未登录态），未知 provider 抛错')
+  console.log('✓ C. 接线基础：Remote namespace subscriptionAuth + 3 端点 + 每渠道一段 volatile Config；providers 返回 4 卡片（含未登录态），未知 provider 抛错')
+}
+
+// ============ 场景 E：令牌已过期 → 先刷新、按 npm 上 codex 最新版发现、写回配置、设置页拿到新列表 ============
+// 修复前：过期令牌让发现直接返回，客户端版本写死，设置页只看到内置兜底列表。
+{
+  const expired = JSON.stringify({ refresh: 'r', access: 'old', expires: Date.now() - 1000 })
+  const requested = []
+  const offline = globalThis.fetch
+  globalThis.fetch = async (url) => {
+    const u = String(url)
+    requested.push(u)
+    const json = (body) => new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })
+    if (u.includes('/oauth/token')) return json({ access_token: 'fresh', expires_in: 3600 })
+    if (u.startsWith('https://registry.npmjs.org/@openai/codex/latest')) return json({ version: '0.160.0' })
+    if (u.includes('/codex/models')) {
+      return json({ models: [
+        { slug: 'gpt-6.1-sol', display_name: 'GPT-6.1-Sol', visibility: 'list', context_window: 272000 },
+        { slug: 'gpt-reserve', visibility: 'hide' },
+      ] })
+    }
+    throw new Error(`unexpected fetch ${u}`)
+  }
+  try {
+    const { calls, mockCtx } = freshHarness({ CHATGPT_SUBSCRIPTION_TOKEN: expired })
+    plugin.apply(mockCtx)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const instance = new calls.plugins[0]({ reflect: { provide: () => {} } })
+    const card = (await instance.providers()).providers.find((p) => p.id === 'chatgpt')
+
+    assert.deepEqual(card.models, ['gpt-6.1-sol'], `设置页拿到发现的列表，不是兜底 (${card.models})`)
+    assert.equal(card.modelsSource, 'discovered', '卡片标明列表来自官方发现')
+    assert.ok(requested.some((u) => u.includes('/oauth/token')), '过期令牌先刷新')
+    assert.ok(requested.some((u) => u.includes('client_version=0.160.0')), `带 npm 最新版本号请求模型 (${requested.join(' | ')})`)
+    assert.equal(requested.filter((u) => u.includes('/codex/models')).length, 1, '门控和设置页同时触发，只发一次发现请求')
+    assert.deepEqual(calls.savedConfig?.chatgpt?.discoveredModels?.map((m) => m.id), ['gpt-6.1-sol'], '发现结果经 configEditor 写回 chatgpt 段')
+    console.log('✓ E. 过期令牌：先刷新，按 codex 最新版发现，写回配置，设置页显示新列表')
+  } finally {
+    globalThis.fetch = offline
+  }
 }
 
 console.log('✓ apply() 接线测试全部通过')

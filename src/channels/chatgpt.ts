@@ -14,7 +14,7 @@ import {
   refreshAccessToken,
   waitForCallback,
 } from '../oauth.js'
-import { fetchCodexModels } from '../discovery.js'
+import { fetchCodexModels, resolveCodexClientVersion } from '../discovery.js'
 import type { ChannelContext, ChannelDefinition, ChannelReasoning, ChannelRuntime } from '../channel.js'
 
 const DEFAULT_MODELS: AdapterModel[] = [
@@ -53,6 +53,16 @@ export const chatgptChannel: ChannelDefinition = {
     let controller: AbortController | undefined
     let pending: { url: string } | undefined
 
+    /** 读令牌，快过期就先刷新并写回；未登录返回 undefined。对话请求和模型发现共用。 */
+    const freshToken = async () => {
+      const token = await ctx.readToken()
+      if (!token) return undefined
+      if (token.expires - Date.now() >= 60_000) return token
+      const refreshed = await refreshAccessToken(token.refresh)
+      await ctx.writeToken(refreshed)
+      return refreshed
+    }
+
     const adapter = new ChatGptAdapter({
       options: () => ({
         apiBaseURL: ctx.options().apiBaseURL,
@@ -63,14 +73,9 @@ export const chatgptChannel: ChannelDefinition = {
       attachments: ctx.attachments,
       reasoning: REASONING,
       resolveAccessToken: async () => {
-        const token = await ctx.readToken()
+        const token = await freshToken()
         if (!token) {
           throw new LlmError('chatgpt: 未登录。请在 设置 → 订阅服务 里完成订阅账号授权。', 'MISSING_CREDENTIAL')
-        }
-        if (token.expires - Date.now() < 60_000) {
-          const refreshed = await refreshAccessToken(token.refresh)
-          await ctx.writeToken(refreshed)
-          return { access: refreshed.access }
         }
         return { access: token.access }
       },
@@ -134,15 +139,18 @@ export const chatgptChannel: ChannelDefinition = {
       },
 
       async discoverModels() {
-        const token = await ctx.readToken()
-        if (!token || token.expires - Date.now() < 60_000) return []
         try {
+          // 过期令牌先刷新：以前这里直接返回空列表，令牌一过期，已登录的账号
+          // 每次启动都只能看到内置的兜底列表，直到重新登录。
+          const token = await freshToken()
+          if (!token) return []
+          const clientVersion = ctx.options().clientVersion ?? await resolveCodexClientVersion(ctx.log)
           return await fetchCodexModels(
             token.access,
             token.accountId,
             ctx.options().apiBaseURL.replace(/\/codex\/responses$/, ''),
             undefined,
-            ctx.options().clientVersion,
+            clientVersion,
           )
         } catch (error) {
           ctx.log(`模型列表发现失败: ${error?.message ?? error}`)

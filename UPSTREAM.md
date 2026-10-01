@@ -67,8 +67,30 @@
 - **kimi 渠道**：`User-Agent` 升至 `KimiCLI/1.5`，补充 `anthropic-version` 请求头。
 - **provider headers 合并**：新增 `mergeProviderHeaders()`，渠道自定义请求头
   以大小写不敏感的方式覆盖 `attributionHeaders()` 的默认值。
+- **2026-10-01：codex 客户端版本不再写死**。后端按 `client_version` 决定发哪些模型
+  （同一账号同一天：0.153.4 拿到 5 个，0.159.3 多出 gpt-6.1-sol / gpt-6-sol /
+  gpt-6-luna）。`resolveCodexClientVersion()` 每次发现前查 npm 上 `@openai/codex`
+  的最新版，6 小时内复用，失败退回上次结果再退回 `CLIENT_VERSION`；渠道配置
+  `clientVersion` 仍然优先。
+- **2026-10-01：过期令牌不再挡住模型发现**。四个渠道的 `discoverModels()` 原先在
+  访问令牌过期时直接返回空列表（`discoverAndStore` 也有同样一道检查），已登录的
+  账号令牌一过期，启动后就只剩内置兜底列表，直到重新登录。现在和对话请求共用
+  `freshToken()`：快过期先刷新再发现。
+- **2026-10-01：设置页不再停在兜底列表**。登录完成时页面轮询拿到「已登录」的那一次
+  `providers` 调用只触发发现、不等结果，页面之后也不再刷新，看到的永远是内置列表。
+  现在 `providers` 等发现结束（最多 10 秒）再回列表，并发触发共用一次请求；卡片带
+  `modelsSource`，页面在列表不是本次官方发现时注明来源。
 
 ### 适配当前 DSH 版本
+
+- **2026-10-01：设置改用 volatile Config**。core 0.2.0-rc.2 的 `dsh-settings` 已经没有
+  `settings.register()`，旧代码在 settings 注入回调里调用它直接抛错，发现结果从此写不回、
+  `clientVersion` / `models` 等配置也读不到。现在插件导出 `Config`，每个渠道一段
+  `.volatile()`，读用引用的 `.get()`，写用 `configEditor.edit(ctx.fiber.entry, …)`
+  （与 core 的 `dsh-agent-default-model` 同形）；provider 的 `settingsNs` 指向本插件
+  条目、`settingsPath` 为 `[<渠道 id>]`。旧的 `subscription-auth-<id>` 命名空间废弃。
+  升 core 时核对：`configEditor.edit` 的签名、`fiber.entry` 是否仍在、volatile 嵌套
+  对象是否仍解析成带 `.get()` 的引用（tests/apply-wiring.mjs 场景 C、E 会炸在这里）。
 
 - `CallId` 重命名为 `ToolCallId`：上游 `@deepseek-ai/dsh-llm` 已改用后者，
   原符号不再导出。

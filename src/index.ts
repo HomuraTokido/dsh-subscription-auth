@@ -2,8 +2,8 @@
  * dsh-subscription-auth：给 dsh 增加订阅会员（ChatGPT / Claude / Grok / Kimi）的
  * OAuth 登录支持。
  *
- * 本模块是薄的通用驱动：遍历 {@link CHANNELS} 里的渠道定义，为每个渠道注册
- * settings 命名空间（subscription-auth-<id>）、llm provider + adapter，以及配置中心
+ * 本模块是薄的通用驱动：遍历 {@link CHANNELS} 里的渠道定义，为每个渠道声明一段
+ * volatile 配置（Config.<id>）、注册 llm provider + adapter，以及配置中心
  * 的登录/注销/状态路由。每个渠道的 OAuth 流程、模型发现与适配器都封装在
  * src/channels/<id>.ts 里（见 src/channel.ts 的 ChannelDefinition 契约）。
  *
@@ -17,11 +17,6 @@ import type { Context as CordisContext } from '@deepseek-ai/cordis'
 import type LlmRuntime from '@deepseek-ai/dsh-llm'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { CredentialProvider } from '@deepseek-ai/dsh-credentials'
-// 只保留类型侧引用：dsh-settings 用 declare module 给 cordis 的 Context 增强出
-// settings 字段，下面 settingsCtx.settings.register(...) 依赖它。补丁在 JS 层
-// 删掉了这行的值导入（settingsNamespace 已不再由该包导出），而 import type {}
-// 不产生任何运行时导入，转译后与补丁产物完全一致。
-import type {} from '@deepseek-ai/dsh-settings'
 import type { AdapterModel } from './adapter.js'
 import type {
   ChannelConfig,
@@ -45,9 +40,6 @@ type Context = CordisContext & { llm: LlmRuntime }
 
 export const name = 'dsh-subscription-auth'
 export const inject = ['llm']
-
-/** settings 命名空间必须匹配 /^[a-z][a-z0-9-]*$/（单段、无点）。 */
-const channelNamespace = (id: string) => `subscription-auth-${id}`
 
 /** 所有订阅渠道（顺序即「订阅服务」页卡片顺序）。 */
 export const CHANNELS: ChannelDefinition[] = [
@@ -90,7 +82,25 @@ function makeConfigSchema(def: ChannelDefinition) {
   })
 }
 
-/** 模型优先级：用户显式 models → settings 持久化的 discoveredModels → 内存发现结果 → 默认列表。 */
+/**
+ * 插件配置：每个渠道一段，整段 volatile。core 0.2 的 settings 服务只编辑插件自己
+ * Config 里声明为 volatile 的字段（旧的 settings.register 已经没有了），写入经
+ * configEditor 落到当前 profile 的 cordis.patch.yml，运行中的引用随之更新、不重挂。
+ */
+export const Config = z.object(Object.fromEntries(
+  CHANNELS.map((def) => [def.id, makeConfigSchema(def).volatile()]),
+))
+
+/** 一个渠道的配置引用（volatile：.get() 返回当前快照）。 */
+type ChannelConfigRef = { get(): ChannelConfig | undefined }
+
+/** 模型列表从哪来：界面据此区分「官方列表」和「内置兜底」。 */
+type ModelsSource = 'config' | 'discovered' | 'saved' | 'builtin'
+
+/**
+ * 模型优先级：用户显式 models → 本次运行发现的结果 → 上次持久化的 discoveredModels → 内置列表。
+ * 本次发现排在持久化之前：写回失败时不让旧列表压住刚拿到的新列表。
+ */
 function resolveOptions(
   raw: ChannelConfig,
   discovered: AdapterModel[] | undefined,
@@ -99,15 +109,18 @@ function resolveOptions(
   apiBaseURL: string
   redirectPort: number
   models: AdapterModel[]
+  modelsSource: ModelsSource
   defaultContextWindow: number
   maxTokens: number
   clientVersion?: string
 } {
-  const source = (raw.models !== undefined && raw.models.length > 0)
-    ? raw.models
-    : (raw.discoveredModels !== undefined && raw.discoveredModels.length > 0)
-      ? raw.discoveredModels
-      : (discovered !== undefined && discovered.length > 0 ? discovered : def.defaultModels)
+  const [source, modelsSource]: [AdapterModel[], ModelsSource] = (raw.models !== undefined && raw.models.length > 0)
+    ? [raw.models, 'config']
+    : (discovered !== undefined && discovered.length > 0)
+      ? [discovered, 'discovered']
+      : (raw.discoveredModels !== undefined && raw.discoveredModels.length > 0)
+        ? [raw.discoveredModels, 'saved']
+        : [def.defaultModels, 'builtin']
   const models = source.map((m) => ({
     id: m.id,
     name: m.name ?? m.id,
@@ -117,6 +130,7 @@ function resolveOptions(
     apiBaseURL: raw.apiBaseURL ?? def.defaultApiBaseURL,
     redirectPort: raw.redirectPort ?? def.defaultRedirectPort,
     models,
+    modelsSource,
     defaultContextWindow: raw.defaultContextWindow ?? def.defaultContextWindow,
     maxTokens: raw.maxTokens ?? def.defaultMaxTokens,
     ...(raw.clientVersion !== undefined && raw.clientVersion.trim() !== ''
@@ -129,20 +143,45 @@ interface ChannelState {
   def: ChannelDefinition
   runtime: ChannelRuntime
   channelCtx: ChannelContext
-  settingsScope?: { get(): ChannelConfig; update(patch: ChannelConfig): Promise<void> }
   discovered?: { models: AdapterModel[]; at: number }
+  /** 进行中的发现：同时来的几次触发（登录回调、设置页轮询）共用一次请求。 */
+  discovering?: Promise<void>
   /** 模型发现/登录状态变化后刷新注册（announce：让 UI 重新拉取列表）。 */
   replaceRegistration?: () => void
   /** 按登录状态注册/撤销 provider + adapter（false = 从模型列表移除）。 */
   syncRegistration?: (enabled: boolean) => void
 }
 
-export function apply(ctx: Context, config: Record<string, unknown> = {}): void {
+/** 插件在 profile 里的条目，以及 core 的配置编辑器（只用到这里出现的几样）。 */
+interface ProfileEntry { options: { id: string } }
+interface ConfigEditor { edit(entry: ProfileEntry, change: (raw: unknown) => unknown): Promise<unknown> }
+
+export function apply(ctx: Context, config: Record<string, ChannelConfigRef | undefined> = {}): void {
   const states = new Map<string, ChannelState>()
   const credentials = () => ctx.get('credentials') as CredentialProvider | undefined
   const attachments = () => ctx.get('attachments')
   /** 插件卸载后停止启动门控轮询。 */
   const gateStopped = new Map<string, boolean>()
+  const entry = (ctx as unknown as { fiber?: { entry?: ProfileEntry } }).fiber?.entry
+  /** 配置中心表单的命名空间就是本插件的 profile 条目 id；provider 的设置链接指向这里。 */
+  const settingsNs = entry?.options.id ?? name
+
+  // 配置写回按提交顺序串行：同一条目的两次 edit 交错会互相覆盖。
+  let saves: Promise<unknown> = Promise.resolve()
+  const writeChannelConfig = async (id: string, patch: ChannelConfig): Promise<void> => {
+    const editor = ctx.get('configEditor') as ConfigEditor | undefined
+    if (entry === undefined || editor === undefined) {
+      logLine(`[${id}] 没有 configEditor 或 profile 条目，配置只在本次运行里生效，重启后不保留`)
+      return
+    }
+    const saved = saves.then(() => editor.edit(entry, (raw) => {
+      const current = raw !== null && typeof raw === 'object' ? raw as Record<string, unknown> : {}
+      const section = current[id] !== null && typeof current[id] === 'object' ? current[id] as ChannelConfig : {}
+      return { ...current, [id]: { ...section, ...patch } }
+    }))
+    saves = saved.catch(() => {})
+    await saved
+  }
 
   // ---------- 每个渠道：构建 ctx + runtime ----------
   for (const def of CHANNELS) {
@@ -175,20 +214,14 @@ export function apply(ctx: Context, config: Record<string, unknown> = {}): void 
       const c = credentials()
       if (c) await c.unset(ref)
     }
-    const getRaw = (): ChannelConfig => {
-      const s = st.settingsScope
-      return s !== undefined ? s.get() : {}
-    }
+    const getRaw = (): ChannelConfig => config[def.id]?.get() ?? {}
 
     const channelCtx: ChannelContext = {
       id: def.id,
       tokenRefName: def.tokenRefName,
       options: () => resolveOptions(getRaw(), st.discovered?.models, def),
       getConfig: getRaw,
-      updateConfig: async (patch) => {
-        const s = st.settingsScope
-        if (s !== undefined) await s.update(patch)
-      },
+      updateConfig: (patch) => writeChannelConfig(def.id, patch),
       credentials,
       attachments,
       log: logLine,
@@ -211,22 +244,31 @@ export function apply(ctx: Context, config: Record<string, unknown> = {}): void 
   }
 
   // ---------- 官方模型列表发现（通用：拉取 → 缓存 → 持久化 → 通知） ----------
-  async function discoverAndStore(st: ChannelState): Promise<void> {
-    const token = await st.channelCtx.readToken()
-    if (!token || token.expires - Date.now() < 60_000) return
-    const found = await st.runtime.discoverModels()
-    if (found.length > 0) {
+  /**
+   * 拉官方模型列表 → 缓存 → 写回配置 → 通知。并发的触发共用同一次请求。
+   * 令牌过期由各渠道的 discoverModels 先刷新，这里只看登没登录。
+   */
+  function discoverAndStore(st: ChannelState): Promise<void> {
+    st.discovering ??= (async () => {
+      const token = await st.channelCtx.readToken()
+      if (!token) return
+      const found = await st.runtime.discoverModels()
+      if (found.length === 0) {
+        logLine(`[${st.def.id}] 没发现到模型（原因见上一行，没有上一行就是接口返回了空列表），模型列表先用${(st.channelCtx.getConfig().discoveredModels?.length ?? 0) > 0 ? '上次保存的' : '内置兜底'}的`)
+        return
+      }
       st.discovered = { models: found, at: Date.now() }
-      if (st.settingsScope !== undefined) {
-        try {
-          await st.settingsScope.update({ discoveredModels: found })
-        } catch (error) {
-          logLine(`模型列表持久化失败: ${(error as Error)?.message ?? error}`)
-        }
+      try {
+        await st.channelCtx.updateConfig({ discoveredModels: found })
+      } catch (error) {
+        logLine(`[${st.def.id}] 模型列表写回配置失败，本次运行照常用新列表，重启后会退回旧的：${(error as Error)?.message ?? error}`)
       }
       st.channelCtx.notifyModelsChanged()
       logLine(`[${st.def.id}] 已发现 ${found.length} 个订阅模型：${found.map((m) => m.id).join(', ')}`)
-    }
+    })().finally(() => {
+      st.discovering = undefined
+    })
+    return st.discovering
   }
 
   async function logoutChannel(st: ChannelState): Promise<void> {
@@ -234,56 +276,13 @@ export function apply(ctx: Context, config: Record<string, unknown> = {}): void 
     st.discovered = undefined
     // 注销后从模型列表移除该提供商（未登录不再占用模型选择器）。
     st.syncRegistration?.(false)
-    if (st.settingsScope !== undefined) {
-      try {
-        await st.settingsScope.update({ discoveredModels: [] })
-      } catch (error) {
-        logLine(`清除模型列表失败: ${(error as Error)?.message ?? error}`)
-      }
+    try {
+      await st.channelCtx.updateConfig({ discoveredModels: [] })
+    } catch (error) {
+      logLine(`清除模型列表失败: ${(error as Error)?.message ?? error}`)
     }
     logLine(`[${st.def.id}] 已注销，清除令牌与模型列表`)
   }
-
-  // ---------- settings：每个渠道一个命名空间 ----------
-  ctx.inject(['settings'], (settingsCtx) => {
-    settingsCtx.effect(() => {
-      const created: { id: string; scope: { get(): ChannelConfig; update(patch: ChannelConfig): Promise<void> } }[] = []
-      for (const def of CHANNELS) {
-        const base = config[def.id]
-        const scope = settingsCtx.settings.register(
-          channelNamespace(def.id),
-          makeConfigSchema(def),
-          { base: base !== undefined && typeof base === 'object' ? (base as ChannelConfig) : {} },
-        )
-        created.push({ id: def.id, scope })
-      }
-      for (const { id, scope } of created) {
-        const st = states.get(id)
-        if (st !== undefined) st.settingsScope = scope
-      }
-      // settings 就绪后补一次检查：覆盖启动门控完成时 settingsScope 尚未
-      // 注册的场景（此时发现结果无法持久化，且注册可能已被竞态误撤）。
-      // 已登录 → 确保注册 + 触发一次发现；发现成功会把 discoveredModels
-      // 持久化到刚就绪的 settings 命名空间。
-      for (const { id } of created) {
-        const st = states.get(id)
-        if (st === undefined) continue
-        void (async () => {
-          if (gateStopped.get(id) === true) return
-          const token = await st.channelCtx.readToken()
-          if (gateStopped.get(id) === true || token === undefined) return
-          st.syncRegistration?.(true)
-          if (st.discovered === undefined) void discoverAndStore(st)
-        })()
-      }
-      return () => {
-        for (const { id } of created) {
-          const st = states.get(id)
-          if (st !== undefined) st.settingsScope = undefined
-        }
-      }
-    }, 'subscription-auth.settings')
-  })
 
   // ---------- provider + adapter 注册（按登录状态门控） ----------
   // 未登录的渠道不注册 provider/adapter：其模型不会出现在模型选择器里。
@@ -296,8 +295,8 @@ export function apply(ctx: Context, config: Record<string, unknown> = {}): void 
     const entry = {
       provider: def.id,
       displayName: def.displayName,
-      settingsNs: channelNamespace(def.id),
-      settingsPath: [] as string[],
+      settingsNs,
+      settingsPath: [def.id],
     }
     const providersHandle = ctx.llm.registerConfigurableProviders([entry])
     const adapterHandle = ctx.llm.registerAdapter([def.id], st.runtime.adapter)
@@ -347,18 +346,24 @@ export function apply(ctx: Context, config: Record<string, unknown> = {}): void 
   // 页面的 fetch 只落到静态处理的 SPA 回退拿到 index.html。gateway 的 /api
   // interceptor 是官方壳唯一通行、legacy 壳同样具备的通道（见 src/remote.ts）。
   const channelCard = async (st: ChannelState): Promise<Record<string, unknown>> => {
-    const state = await st.runtime.authStatus()
-    // 已登录但还没有发现结果（例如升级插件后已登录的存量会话）：顺手触发一次。
+    let state = await st.runtime.authStatus()
+    // 已登录但还没有发现结果：当场发现并等它（最多 10 秒）再回列表。以前是
+    // 触发了就走，页面在登录完成那一刻拿到的永远是兜底列表，之后也不会再刷新。
     if (state.status === 'logged-in' && st.discovered === undefined) {
-      void discoverAndStore(st)
+      await Promise.race([
+        discoverAndStore(st),
+        new Promise((resolve) => setTimeout(resolve, 10_000)),
+      ])
+      // 发现前可能刷新过令牌，状态里的有效期跟着更新。
+      state = await st.runtime.authStatus()
     }
-    const models = resolveOptions(st.channelCtx.getConfig(), st.discovered?.models, st.def)
-      .models.map((m) => m.id)
+    const resolved = resolveOptions(st.channelCtx.getConfig(), st.discovered?.models, st.def)
     return {
       id: st.def.id,
       name: st.def.name,
       description: st.def.description,
-      models,
+      models: resolved.models.map((m) => m.id),
+      modelsSource: resolved.modelsSource,
       ...(st.discovered !== undefined ? { discoveredAt: st.discovered.at } : {}),
       ...state,
     }

@@ -123,55 +123,59 @@ dsh plugin --profile web add dsh-subscription-auth
 
 > 注意：**未登录的提供商不会出现在模型选择器里**（provider/adapter 按登录状态注册）：登录成功后才注册进模型列表，注销后自动移除。设置 → 订阅服务 页始终列出全部四个渠道以便登录。
 
-> 注意：**已登录的提供商在 dsh 启动时即自动注册并发现模型**（启动门控会等待 credential 服务就绪，settings 就绪后还会补一次检查），无需先进入设置页。
+> 注意：**已登录的提供商在 dsh 启动时即自动注册并发现模型**（启动门控会等待 credential 服务就绪；访问令牌过期时先用 refresh token 刷新再发现），无需先进入设置页。
 
 ## 配置
 
-每个渠道一个 settings 命名空间（`subscription-auth-<id>`）。模型优先级：手动 `models` → 登录发现并持久化的 `discoveredModels` → 渠道内置默认列表。
+配置写在本插件 profile 条目的 `config` 下，每个渠道一段（`chatgpt` / `claude` / `grok` / `kimi`），
+整段声明为 volatile：core 0.2 的配置中心可以直接编辑，插件自己写回发现结果也走这条路
+（`configEditor` 落到当前 profile 的 `cordis.patch.yml`），改动不需要重启。模型优先级：
+手动 `models` → 本次运行发现的列表 → 上次写回的 `discoveredModels` → 渠道内置兜底列表。
+订阅服务页的「可用模型」标题会注明列表不是本次官方发现时的来源。
 
 ```yaml
-subscription-auth-chatgpt:
-  apiBaseURL: https://chatgpt.com/backend-api/codex/responses
-  redirectPort: 1455
-  maxTokens: 8192
-
-subscription-auth-claude:
-  apiBaseURL: https://api.anthropic.com/v1/messages
-  redirectPort: 54545
-  maxTokens: 64000
-
-subscription-auth-grok:
-  apiBaseURL: https://api.x.ai/v1/responses
-  maxTokens: 8192
-
-subscription-auth-kimi:
-  apiBaseURL: https://api.kimi.com/coding/v1/messages
-  maxTokens: 32768
+- id: dsh-subscription-auth
+  name: dsh-subscription-auth
+  config:
+    chatgpt:
+      apiBaseURL: https://chatgpt.com/backend-api/codex/responses
+      redirectPort: 1455
+      maxTokens: 8192
+    claude:
+      apiBaseURL: https://api.anthropic.com/v1/messages
+      redirectPort: 54545
+      maxTokens: 64000
+    grok:
+      apiBaseURL: https://api.x.ai/v1/responses
+      maxTokens: 8192
+    kimi:
+      apiBaseURL: https://api.kimi.com/coding/v1/messages
+      maxTokens: 32768
 ```
 
-ChatGPT 渠道另有 `clientVersion`：模型发现请求携带的 codex 客户端版本号，后端按它决定
-发哪些模型（老版本号看不到新模型）。默认值跟随代码里的 `CLIENT_VERSION`；本机 Codex
-更新后新模型没出现时，把它设成本机 `codex --version` 的值，重新登录或重启即可：
+ChatGPT 渠道的模型发现要带 codex 客户端版本号，后端按它决定发哪些模型（老版本号看不到
+新模型）。插件每次发现前去 `registry.npmjs.org/@openai/codex/latest` 查最新版（6 小时内
+复用），查不到退回上次查到的版本，再退回代码里的 `CLIENT_VERSION`。要钉死某个版本时配
+`clientVersion`，它优先于自动查询：
 
 ```yaml
-subscription-auth-chatgpt:
-  clientVersion: "0.153.4"
+    chatgpt:
+      clientVersion: "0.159.3"
 ```
 
 `models` 可手动固定模型列表（可选；不配则用登录后自动发现的官方列表），例如：
 
 ```yaml
-subscription-auth-claude:
-  models:
-    - { id: claude-sonnet-5, name: Claude Sonnet 5, contextWindow: 1000000 }
+    claude:
+      models:
+        - { id: claude-sonnet-5, name: Claude Sonnet 5, contextWindow: 1000000 }
 ```
 
 ## 检测（日志）
 
 ```powershell
-Get-Content "$HOME\.dsh\tmp\subscription-auth.log"          # 插件日志（登录/发现/错误）
-Get-Content "$HOME\.dsh\settings.yaml" | Select-String -Pattern "subscription-auth" -Context 0,15  # 持久化模型列表
-Invoke-WebRequest "http://127.0.0.1:<dsh-port>/subscription-auth/providers"  # 实时状态
+Get-Content "$HOME\.dsh\tmp\subscription-auth.log"   # 插件日志（登录/发现/版本查询/错误）
+Select-String -Path "$env:DSH_HOME\profiles\<profile>\cordis.patch.yml" -Pattern "dsh-subscription-auth" -Context 0,20  # 写回的配置
 ```
 
 ## 测试
