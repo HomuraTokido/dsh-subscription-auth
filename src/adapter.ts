@@ -137,6 +137,19 @@ async function serializeRequest(
       input.push(...calls)
       continue
     }
+    // tool：dsh 会话格式 v4（core 0.1.7 起）把工具结果做成独立的 role:'tool' 消息，
+    // 用 toolCallId 对应调用、content 是普通内容块。v3 及以前是 user 消息里的
+    // tool-result 块（下面的分支，留着给旧会话回放）。漏了这一支，结果会被当成一段
+    // 用户文本发出去，function_call 没有对应的 output，codex 端点整轮 400
+    // "No tool output found for function call"（2026-10-05 才发现，坏了自 0.1.7）。
+    if (message.role === 'tool') {
+      input.push({
+        type: 'function_call_output',
+        call_id: message.toolCallId,
+        output: flattenText(message.content) || '(no output)',
+      })
+      continue
+    }
     // user：文本/图片 → message；tool-result → function_call_output
     const contentParts: any[] = []
     for (const block of message.content) {

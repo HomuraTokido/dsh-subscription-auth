@@ -113,6 +113,17 @@ async function serializeRequest(
       }
       continue
     }
+    // tool：dsh 会话格式 v4（core 0.1.7 起）的独立 role:'tool' 消息，见 adapter.ts 同名分支。
+    // Messages API 要求 tool_result 放在紧跟 tool_use 的 user 消息里。
+    if (message.role === 'tool') {
+      push('user', {
+        type: 'tool_result',
+        tool_use_id: message.toolCallId,
+        content: flattenText(message.content) || '(no output)',
+        ...(message.isError === true ? { is_error: true } : {}),
+      })
+      continue
+    }
     // user：文本 → text；tool-result → tool_result
     for (const block of message.content) {
       if (block.type === 'text') {
