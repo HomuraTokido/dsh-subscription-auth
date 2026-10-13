@@ -73,6 +73,8 @@ export interface AuthStatus {
   expiresAt?: number
   url?: string
   userCode?: string
+  /** 最近一次登录失败的原因（未登录时才有）；重试 / 注销后清空。 */
+  error?: string
 }
 
 /** 通用驱动注入给每个渠道的依赖。 */
@@ -97,6 +99,8 @@ export interface ChannelContext {
   writeToken(token: StoredToken): Promise<void>
   /** 删除本渠道令牌。 */
   clearToken(): Promise<void>
+  /** 登录成功后的后续动作（驱动实现为触发模型发现 + 重新注册 provider）。 */
+  afterLogin(): void
 }
 
 export interface ChannelRuntime {
@@ -105,6 +109,8 @@ export interface ChannelRuntime {
   login(): Promise<LoginResult>
   authStatus(): Promise<AuthStatus>
   logout(): Promise<void>
+  /** 中止进行中的登录会话（回调服务器 / 设备轮询）并清掉 pending 状态。 */
+  cancelLogin(): void
   /** 拉取官方模型列表；失败返回空数组（调用方回退默认列表）。 */
   discoverModels(): Promise<AdapterModel[]>
 }

@@ -21,10 +21,10 @@
 | 令牌端点 | `https://auth.openai.com/oauth/token` | `https://api.anthropic.com/v1/oauth/token` | （OIDC 发现 `https://auth.x.ai/.well-known/openid-configuration`） | `https://auth.kimi.com/api/oauth/token` |
 | `client_id` | `app_EMoamEEZ73f0CkXaXp7hrann` | `9d1c250a-e61b-44d9-88ed-5944d1962f5e` | `b1a00492-073a-47ea-816f-4c329264a828` | `17e5f671-d194-4dfb-9706-5516cb48c098` |
 | scope | `openid profile email offline_access api.connectors.read api.connectors.invoke` | `org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload` | `openid profile email offline_access grok-cli:access api:access` | （设备流，无 scope） |
-| 回调 | `http://localhost:1455/auth/callback` | `http://localhost:54545/callback` | 设备流（无回调） | 设备流（无回调） |
+| 回调 | `http://localhost:1455/auth/callback`（被占用时改 1457；两个都占不到则退回官方设备授权） | `http://localhost:54545/callback` | 设备流（无回调） | 设备流（无回调） |
 | 调用端点 | `https://chatgpt.com/backend-api/codex/responses` | `https://api.anthropic.com/v1/messages` | `https://api.x.ai/v1/responses` | `https://api.kimi.com/coding/v1/messages` |
 
-**登录时**：授权码渠道（ChatGPT / Claude）生成 PKCE 挑战 → 用 `rundll32` 打开浏览器（**不能用 `cmd /c start`**：URL 里的 `&` 会被截断）→ 本地一次性 HTTP 服务器收 `code`+`state`（10 分钟超时）→ 换令牌 → 存进 credential 服务。设备流渠道（Grok / Kimi）请求设备码 → 打开验证页并展示授权码 → 后台轮询直到用户完成授权 → 存令牌。之后每次请求前检查 access token 快过期则静默续期。
+**登录时**：授权码渠道（ChatGPT / Claude）生成 PKCE 挑战 → 用 `rundll32` 打开浏览器（**不能用 `cmd /c start`**：URL 里的 `&` 会被截断）→ 本地一次性 HTTP 服务器（只监听 `127.0.0.1`）收 `code`+`state`（10 分钟超时）→ 换令牌 → 存进 credential 服务。ChatGPT 只试 OpenAI 注册过的两个回调端口 **1455 / 1457**（配置里指定其中之一则优先；只有 `EACCES` / `EADDRINUSE` 才换下一个，不做任意端口兜底），端口真的绑定成功后才打开浏览器；两个端口都占不到时自动退回 **官方设备授权**（`https://auth.openai.com/codex/device` 输入授权码，15 分钟过期）。设备流渠道（Grok / Kimi）请求设备码 → 打开验证页并展示授权码 → 后台轮询直到用户完成授权 → 存令牌。之后每次请求前检查 access token 快过期则静默续期。
 
 ## 安装
 
@@ -104,8 +104,10 @@ dsh plugin --profile web add dsh-subscription-auth
 1. 打开 **设置 → 订阅服务**：列出四个订阅提供商，显示登录状态、账号与可用模型（折叠列表）。
 
 2. 点「登录」：
-   - **ChatGPT / Claude**：浏览器自动打开授权页 → 登录并授权 → 跳回 localhost 回调 → 页面轮询到「已登录」→ 自动拉取官方模型列表。
+   - **ChatGPT / Claude**：浏览器自动打开授权页 → 登录并授权 → 跳回 localhost 回调（ChatGPT 用 1455，被占用时用 1457）→ 页面轮询到「已登录」→ 自动拉取官方模型列表。ChatGPT 在这两个端口都不可用时改为显示官方设备授权码（同 Grok / Kimi 的交互）。
    - **Grok / Kimi**：页面显示验证链接 + 设备授权码 → 在浏览器打开链接并输入代码 → 页面轮询到「已登录」→ 自动拉取模型列表。
+
+   登录失败时卡片里会直接显示原因（设备码请求 / 轮询 / 换令牌的错误都会记到下一次「订阅服务」页刷新）。
 
 3. 在模型选择里切到对应的提供商（如「Claude (订阅)」），选一个模型即可对话。
 
