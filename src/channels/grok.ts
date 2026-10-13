@@ -7,11 +7,25 @@
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import { ChatGptAdapter } from '../adapter.js'
 import type { AdapterModel } from '../adapter.js'
-import { openBrowser } from '../oauth.js'
+import { boundedSignal, openBrowser, readAuthJson } from '../oauth.js'
 import { pollDeviceFlow } from '../device-flow.js'
-import type { ChannelContext, ChannelDefinition, ChannelReasoning, ChannelRuntime } from '../channel.js'
+import type { DevicePollResult } from '../device-flow.js'
+import type {
+  AuthStatus,
+  ChannelContext,
+  ChannelDefinition,
+  ChannelReasoning,
+  ChannelRuntime,
+  LoginResult,
+} from '../channel.js'
+import { AuthSession } from '../auth-session.js'
 
 const CLIENT_ID = 'b1a00492-073a-47ea-816f-4c329264a828'
+
+/** `unknown` 错误的可读文本（catch 变量在 strict 下是 unknown，不能直接取 .message）。 */
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
 const SCOPE = 'openid profile email offline_access grok-cli:access api:access'
 
 const DEFAULT_MODELS: AdapterModel[] = [
@@ -36,15 +50,21 @@ const REASONING: ChannelReasoning = {
 }
 
 /** 从 OIDC 元数据发现 token_endpoint（设备流 / 续期共用）。 */
-async function discoverTokenEndpoint(): Promise<string> {
-  const res = await fetch('https://auth.x.ai/.well-known/openid-configuration', {
-    headers: { accept: 'application/json' },
-  })
-  if (!res.ok) throw new Error(`OIDC 发现失败 (HTTP ${res.status})`)
-  const meta = (await res.json()) as any
-  const endpoint = typeof meta?.token_endpoint === 'string' ? meta.token_endpoint : undefined
-  if (!endpoint) throw new Error('OIDC 发现响应缺少 token_endpoint')
-  return endpoint
+async function discoverTokenEndpoint(signal?: AbortSignal): Promise<string> {
+  const request = boundedSignal(signal)
+  try {
+    const res = await fetch('https://auth.x.ai/.well-known/openid-configuration', {
+      headers: { accept: 'application/json' },
+      signal: request.signal,
+    })
+    if (!res.ok) throw new Error(`OIDC 发现失败 (HTTP ${res.status})`)
+    const meta = await readAuthJson(res, 'OIDC 发现响应不是合法 JSON')
+    const endpoint = typeof meta?.token_endpoint === 'string' ? meta.token_endpoint : undefined
+    if (!endpoint) throw new Error('OIDC 发现响应缺少 token_endpoint')
+    return endpoint
+  } finally {
+    request.cleanup()
+  }
 }
 
 function decodeJwt(token: string): any | undefined {
@@ -64,19 +84,28 @@ function accountIdFromAccessToken(access: string): string | undefined {
 }
 
 /** GET userinfo 取 sub/email/name；acountId 用 sub（实际以 email 为准可另行扩展）。 */
-async function fetchUserinfo(access: string): Promise<{ accountId?: string; email?: string }> {
+async function fetchUserinfo(
+  access: string,
+  signal?: AbortSignal,
+): Promise<{ accountId?: string; email?: string }> {
+  const request = boundedSignal(signal)
   try {
     const res = await fetch('https://auth.x.ai/oauth2/userinfo', {
       headers: { authorization: `Bearer ${access}`, accept: 'application/json' },
+      signal: request.signal,
     })
     if (!res.ok) return { accountId: accountIdFromAccessToken(access) }
-    const info = (await res.json()) as any
+    const info = await readAuthJson(res, 'userinfo 响应不是合法 JSON')
     const accountId =
       typeof info?.sub === 'string' && info.sub !== '' ? info.sub : accountIdFromAccessToken(access)
     const email = typeof info?.email === 'string' ? info.email : undefined
     return { accountId, email }
-  } catch {
+  } catch (error) {
+    // 取消必须原样抛出去（不能当成「拿不到 userinfo」静默降级）
+    if (signal?.aborted) throw error
     return { accountId: accountIdFromAccessToken(access) }
+  } finally {
+    request.cleanup()
   }
 }
 
@@ -96,79 +125,100 @@ function toStoredToken(json: any, fallbackRefresh: string | undefined = undefine
 async function exchangeDeviceCode(
   tokenEndpoint: string,
   deviceCode: string,
-): Promise<{ status: 'complete' | 'pending' | 'slow_down' | 'failed'; message?: string; value?: any }> {
-  const res = await fetch(tokenEndpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
-      client_id: CLIENT_ID,
-      device_code: deviceCode,
-    }).toString(),
-  })
-  const body = await res.json().catch(() => ({})) as any
-  if (res.ok && typeof body?.access_token === 'string' && body.access_token !== '') {
-    return { status: 'complete', value: body }
-  }
-  switch (body?.error) {
-    case 'authorization_pending':
-      return { status: 'pending' }
-    case 'slow_down':
-      return { status: 'slow_down' }
-    case 'access_denied':
-      return { status: 'failed', message: '用户拒绝了授权' }
-    case 'expired_token':
-      return { status: 'failed', message: '设备授权已过期，请重新发起登录' }
-    default:
-      return {
-        status: 'failed',
-        message: `设备授权失败${body?.error ? `: ${body.error}` : ''}`,
-      }
+  signal?: AbortSignal,
+): Promise<DevicePollResult<any>> {
+  const request = boundedSignal(signal)
+  try {
+    const res = await fetch(tokenEndpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+        client_id: CLIENT_ID,
+        device_code: deviceCode,
+      }).toString(),
+      signal: request.signal,
+    })
+    const body = await readAuthJson(res, '设备授权响应不是合法 JSON').catch(() => ({}))
+    if (res.ok && typeof body?.access_token === 'string' && body.access_token !== '') {
+      return { status: 'complete', value: body }
+    }
+    // 错误串只用错误码（协议字段），不回显响应体
+    const code = typeof body?.error === 'string' ? body.error : ''
+    switch (code) {
+      case 'authorization_pending':
+        return { status: 'pending' }
+      case 'slow_down':
+        return { status: 'slow_down' }
+      case 'access_denied':
+        return { status: 'failed', message: '用户拒绝了授权' }
+      case 'expired_token':
+        return { status: 'failed', message: '设备授权已过期，请重新发起登录' }
+      default:
+        return { status: 'failed', message: `设备授权失败${code !== '' ? `: ${code}` : ''}` }
+    }
+  } finally {
+    request.cleanup()
   }
 }
 
-async function startDeviceFlow(): Promise<{
+async function startDeviceFlow(signal?: AbortSignal): Promise<{
   deviceCode: string
   intervalSeconds: number
   expiresInSeconds: number
   verificationUriComplete: string
   userCode: string
 }> {
-  const res = await fetch('https://auth.x.ai/oauth2/device/code', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ client_id: CLIENT_ID, scope: SCOPE }).toString(),
-  })
-  if (!res.ok) throw new Error(`设备码请求失败 (HTTP ${res.status})`)
-  const body = (await res.json()) as any
-  const deviceCode = typeof body?.device_code === 'string' ? body.device_code : ''
-  const userCode = typeof body?.user_code === 'string' ? body.user_code : ''
-  if (!deviceCode || !userCode) throw new Error('设备码响应缺少 device_code/user_code')
-  return {
-    deviceCode,
-    intervalSeconds: typeof body?.interval === 'number' ? body.interval : 5,
-    expiresInSeconds: typeof body?.expires_in === 'number' ? body.expires_in : 600,
-    verificationUriComplete:
-      typeof body?.verification_uri_complete === 'string'
-        ? body.verification_uri_complete
-        : (typeof body?.verification_uri === 'string' ? body.verification_uri : ''),
-    userCode,
+  const request = boundedSignal(signal)
+  try {
+    const res = await fetch('https://auth.x.ai/oauth2/device/code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ client_id: CLIENT_ID, scope: SCOPE }).toString(),
+      signal: request.signal,
+    })
+    if (!res.ok) throw new Error(`设备码请求失败 (HTTP ${res.status})`)
+    const body = await readAuthJson(res, '设备码响应不是合法 JSON')
+    const deviceCode = typeof body?.device_code === 'string' ? body.device_code : ''
+    const userCode = typeof body?.user_code === 'string' ? body.user_code : ''
+    if (!deviceCode || !userCode) throw new Error('设备码响应缺少 device_code/user_code')
+    return {
+      deviceCode,
+      intervalSeconds: typeof body?.interval === 'number' ? body.interval : 5,
+      expiresInSeconds: typeof body?.expires_in === 'number' ? body.expires_in : 600,
+      verificationUriComplete:
+        typeof body?.verification_uri_complete === 'string'
+          ? body.verification_uri_complete
+          : (typeof body?.verification_uri === 'string' ? body.verification_uri : ''),
+      userCode,
+    }
+  } finally {
+    request.cleanup()
   }
 }
 
-async function refreshToken(refresh: string): Promise<{ refresh: string; access: string; expires: number }> {
-  const tokenEndpoint = await discoverTokenEndpoint()
-  const res = await fetch(tokenEndpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type: 'refresh_token',
-      client_id: CLIENT_ID,
-      refresh_token: refresh,
-    }).toString(),
-  })
-  if (!res.ok) throw new Error(`令牌续期失败 (HTTP ${res.status})`)
-  return toStoredToken(await res.json(), refresh)
+async function refreshToken(
+  refresh: string,
+  signal?: AbortSignal,
+): Promise<{ refresh: string; access: string; expires: number }> {
+  const tokenEndpoint = await discoverTokenEndpoint(signal)
+  const request = boundedSignal(signal)
+  try {
+    const res = await fetch(tokenEndpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token',
+        client_id: CLIENT_ID,
+        refresh_token: refresh,
+      }).toString(),
+      signal: request.signal,
+    })
+    if (!res.ok) throw new Error(`令牌续期失败 (HTTP ${res.status})`)
+    return toStoredToken(await readAuthJson(res, '令牌续期响应不是合法 JSON'), refresh)
+  } finally {
+    request.cleanup()
+  }
 }
 
 /** 从 xAI 官方 API 拉取模型列表并过滤掉非对话模型。 */
@@ -206,18 +256,15 @@ export const grokChannel: ChannelDefinition = {
   reasoning: REASONING,
 
   create(ctx: ChannelContext): ChannelRuntime {
-    let controller: AbortController | undefined
-    let pending: { url: string; userCode: string } | undefined
+    const session = new AuthSession<{ url: string; userCode?: string }>({
+      log: ctx.log,
+      write: (token, isCurrent) => ctx.writeToken(token, isCurrent),
+      afterLogin: ctx.afterLogin,
+    })
 
     /** 读令牌，快过期就先刷新并写回；未登录返回 undefined。对话请求和模型发现共用。 */
-    const freshToken = async () => {
-      const token = await ctx.readToken()
-      if (!token) return undefined
-      if (token.expires - Date.now() >= 60_000) return token
-      const refreshed = { ...token, ...await refreshToken(token.refresh) }
-      await ctx.writeToken(refreshed)
-      return refreshed
-    }
+    const freshToken = () =>
+      ctx.freshToken((token, signal) => refreshToken(token.refresh, signal))
 
     const adapter = new ChatGptAdapter({
       options: () => ({
@@ -242,74 +289,80 @@ export const grokChannel: ChannelDefinition = {
     return {
       adapter,
 
-      async login() {
+      async login(): Promise<LoginResult> {
+        // 先同步作废旧尝试（abort + 清 pending/error），再做任何 await。
+        const attempt = session.begin()
         const existing = await ctx.readToken()
+        if (!attempt.isCurrent()) throw new Error('aborted')
         if (existing && existing.expires > Date.now() + 60_000) {
+          session.settle(attempt)
           return { status: 'logged-in', account: existing.accountId }
         }
-        this.cancelLogin()
         try {
-          const flow = await startDeviceFlow()
-          const tokenEndpoint = await discoverTokenEndpoint()
-          controller = new AbortController()
-          pending = { url: flow.verificationUriComplete, userCode: flow.userCode }
+          const flow = await startDeviceFlow(attempt.signal)
+          if (!attempt.isCurrent()) throw new Error('aborted')
+          const tokenEndpoint = await discoverTokenEndpoint(attempt.signal)
+          if (!attempt.isCurrent()) throw new Error('aborted')
+          attempt.publish({ url: flow.verificationUriComplete, userCode: flow.userCode })
 
-          pollDeviceFlow({
-            signal: controller.signal,
+          void pollDeviceFlow<any>({
+            signal: attempt.signal,
             intervalSeconds: flow.intervalSeconds,
             expiresInSeconds: flow.expiresInSeconds,
-            poll: () => exchangeDeviceCode(tokenEndpoint, flow.deviceCode),
+            poll: (): Promise<DevicePollResult<any>> =>
+              exchangeDeviceCode(tokenEndpoint, flow.deviceCode, attempt.signal),
           })
             .then(async (body) => {
+              if (!attempt.isCurrent()) return
               const base = toStoredToken(body)
-              const user = await fetchUserinfo(base.access)
+              const user = await fetchUserinfo(base.access, attempt.signal)
+              if (!attempt.isCurrent()) return
               const stored = {
                 ...base,
                 ...(user.accountId !== undefined ? { accountId: user.accountId } : {}),
                 ...(user.email !== undefined ? { email: user.email } : {}),
               }
-              await ctx.writeToken(stored)
-              ctx.log(`登录成功${stored.accountId ? `（account: ${stored.accountId}）` : ''}，开始发现模型列表…`)
-              ctx.afterLogin()
+              await session.succeed(attempt, stored)
             })
-            .catch((error: any) => {
-              if (controller && !controller.signal.aborted) {
-                ctx.log(`登录失败: ${error?.message ?? error}`)
-              }
-            })
-            .finally(() => {
-              pending = undefined
-            })
+            .catch((error: unknown) => { session.fail(attempt, error) })
 
           if (flow.verificationUriComplete) openBrowser(flow.verificationUriComplete)
           return { status: 'pending', url: flow.verificationUriComplete, userCode: flow.userCode }
-        } catch (error: any) {
-          this.cancelLogin()
-          ctx.log(`初始化登录失败: ${error?.message ?? error}`)
+        } catch (error: unknown) {
+          session.fail(attempt, error)
           throw error
         }
       },
 
-      async authStatus() {
+      async authStatus(): Promise<AuthStatus> {
         const token = await ctx.readToken()
         if (token) {
           return { provider: ctx.id, status: 'logged-in', account: token.accountId, expiresAt: token.expires }
         }
-        if (pending && controller && !controller.signal.aborted) {
-          return { provider: ctx.id, status: 'pending', url: pending.url, userCode: pending.userCode }
+        const pending = session.pending()
+        if (pending !== undefined) {
+          return {
+            provider: ctx.id,
+            status: 'pending',
+            url: pending.url,
+            ...(pending.userCode !== undefined ? { userCode: pending.userCode } : {}),
+          }
+        }
+        const error = session.lastError()
+        if (error !== undefined) {
+          return { provider: ctx.id, status: 'not-logged-in', error }
         }
         return { provider: ctx.id, status: 'not-logged-in' }
       },
 
       async logout() {
-        this.cancelLogin()
+        // 先 cancel（abort + 清 pending/error），再清凭据。
+        session.cancel()
         await ctx.clearToken()
       },
 
       cancelLogin() {
-        if (controller && !controller.signal.aborted) controller.abort()
-        controller = undefined
-        pending = undefined
+        session.cancel()
       },
 
       async discoverModels() {
@@ -317,8 +370,8 @@ export const grokChannel: ChannelDefinition = {
           const token = await freshToken()
           if (!token) return []
           return await fetchGrokModels(token.access)
-        } catch (error: any) {
-          ctx.log(`模型列表发现失败: ${error?.message ?? error}`)
+        } catch (error) {
+          ctx.log(`模型列表发现失败: ${messageOf(error)}`)
           return []
         }
       },

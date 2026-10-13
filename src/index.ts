@@ -15,15 +15,14 @@
 import z from '@deepseek-ai/schemastery'
 import type { Context as CordisContext } from '@deepseek-ai/cordis'
 import type LlmRuntime from '@deepseek-ai/dsh-llm'
-import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { CredentialProvider } from '@deepseek-ai/dsh-credentials'
 import type { AdapterModel } from './adapter.js'
+import { TokenStore } from './token-store.js'
 import type {
   ChannelConfig,
   ChannelContext,
   ChannelDefinition,
   ChannelRuntime,
-  StoredToken,
 } from './channel.js'
 import { chatgptChannel } from './channels/chatgpt.js'
 import { claudeChannel } from './channels/claude.js'
@@ -144,8 +143,16 @@ interface ChannelState {
   runtime: ChannelRuntime
   channelCtx: ChannelContext
   discovered?: { models: AdapterModel[]; at: number }
-  /** 进行中的发现：同时来的几次触发（登录回调、设置页轮询）共用一次请求。 */
-  discovering?: Promise<void>
+  /**
+   * 归属版本：logout / 卸载立即 +1，作废在途的模型发现（拿到结果后不再写配置、
+   * 不再注册/通知）。进行中的发现带着自己的版本号，旧发现的 finally 清不掉新的。
+   */
+  revision: number
+  tokenStore?: TokenStore
+  /** 插件卸载后不再写配置 / 注册 provider。 */
+  disposed: boolean
+  /** 进行中的发现：同一版本内并发的触发（登录回调、设置页轮询）共用一次请求。 */
+  discovering?: { revision: number; promise: Promise<void> }
   /** 模型发现/登录状态变化后刷新注册（announce：让 UI 重新拉取列表）。 */
   replaceRegistration?: () => void
   /** 按登录状态注册/撤销 provider + adapter（false = 从模型列表移除）。 */
@@ -168,13 +175,20 @@ export function apply(ctx: Context, config: Record<string, ChannelConfigRef | un
 
   // 配置写回按提交顺序串行：同一条目的两次 edit 交错会互相覆盖。
   let saves: Promise<unknown> = Promise.resolve()
-  const writeChannelConfig = async (id: string, patch: ChannelConfig): Promise<void> => {
+  const writeChannelConfig = async (
+    id: string,
+    patch: ChannelConfig,
+    guard?: () => boolean,
+  ): Promise<void> => {
     const editor = ctx.get('configEditor') as ConfigEditor | undefined
     if (entry === undefined || editor === undefined) {
       logLine(`[${id}] 没有 configEditor 或 profile 条目，配置只在本次运行里生效，重启后不保留`)
       return
     }
+    if (guard !== undefined && !guard()) return
     const saved = saves.then(() => editor.edit(entry, (raw) => {
+      // guard 在真正写的那一刻再验一次：这次发现可能已经被注销 / 卸载作废
+      if (guard !== undefined && !guard()) return raw
       const current = raw !== null && typeof raw === 'object' ? raw as Record<string, unknown> : {}
       const section = current[id] !== null && typeof current[id] === 'object' ? current[id] as ChannelConfig : {}
       return { ...current, [id]: { ...section, ...patch } }
@@ -189,31 +203,20 @@ export function apply(ctx: Context, config: Record<string, ChannelConfigRef | un
       def,
       runtime: undefined as unknown as ChannelRuntime,
       channelCtx: undefined as unknown as ChannelContext,
+      revision: 0,
+      disposed: false,
     }
     states.set(def.id, st)
 
-    const ref = credentialRef(def.tokenRefName)
-    const readToken = async (): Promise<StoredToken | undefined> => {
-      const c = credentials()
-      if (!c) return undefined
-      const hit = await c.resolve(ref)
-      if (!hit) return undefined
-      try {
-        const t = JSON.parse(hit.value) as StoredToken
-        if (t && typeof t.refresh === 'string' && typeof t.access === 'string') return t
-      } catch {
-        /* corrupt → treat as absent */
-      }
-      return undefined
-    }
-    const writeToken = async (token: StoredToken): Promise<void> => {
-      const c = credentials()
-      if (c) await c.set(ref, JSON.stringify(token))
-    }
-    const clearToken = async (): Promise<void> => {
-      const c = credentials()
-      if (c) await c.unset(ref)
-    }
+    // 令牌事务存储：真实凭据是 `subscription-auth/<渠道 id>` 的 grant record，
+    // 旧的 `<渠道>_SUBSCRIPTION_TOKEN` 引用只作为一次性迁移来源。
+    const store = new TokenStore({
+      provider: credentials,
+      channelId: def.id,
+      legacyRefName: def.tokenRefName,
+      log: (message) => logLine(`[${def.id}] ${message}`),
+    })
+    st.tokenStore = store
     const getRaw = (): ChannelConfig => config[def.id]?.get() ?? {}
 
     const channelCtx: ChannelContext = {
@@ -221,7 +224,7 @@ export function apply(ctx: Context, config: Record<string, ChannelConfigRef | un
       tokenRefName: def.tokenRefName,
       options: () => resolveOptions(getRaw(), st.discovered?.models, def),
       getConfig: getRaw,
-      updateConfig: (patch) => writeChannelConfig(def.id, patch),
+      updateConfig: (patch, guard) => writeChannelConfig(def.id, patch, guard),
       credentials,
       attachments,
       log: logLine,
@@ -232,9 +235,10 @@ export function apply(ctx: Context, config: Record<string, ChannelConfigRef | un
           logLine(`模型列表刷新通知失败: ${(error as Error)?.message ?? error}`)
         }
       },
-      readToken,
-      writeToken,
-      clearToken,
+      readToken: () => store.read(),
+      freshToken: (refresh) => store.fresh(refresh),
+      writeToken: (token, isCurrent) => store.write(token, isCurrent),
+      clearToken: () => store.clear(),
       afterLogin: () => {
         void discoverAndStore(st)
       },
@@ -245,39 +249,55 @@ export function apply(ctx: Context, config: Record<string, ChannelConfigRef | un
 
   // ---------- 官方模型列表发现（通用：拉取 → 缓存 → 持久化 → 通知） ----------
   /**
-   * 拉官方模型列表 → 缓存 → 写回配置 → 通知。并发的触发共用同一次请求。
-   * 令牌过期由各渠道的 discoverModels 先刷新，这里只看登没登录。
+   * 拉官方模型列表 → 缓存 → 写回配置 → 通知。同一版本内并发的触发共用一次请求。
+   * 每个 await 之后、排队 configEditor 之前、注册/通知之前都验一次 revision：
+   * logout / 卸载之后的迟到发现不再写配置、不再注册 provider。
    */
   function discoverAndStore(st: ChannelState): Promise<void> {
-    st.discovering ??= (async () => {
+    if (st.disposed) return Promise.resolve()
+    const revision = st.revision
+    const current = (): boolean => !st.disposed && st.revision === revision
+    const running = st.discovering
+    if (running !== undefined && running.revision === revision) return running.promise
+
+    const promise = (async () => {
       const token = await st.channelCtx.readToken()
-      if (!token) return
+      if (!current() || !token) return
       const found = await st.runtime.discoverModels()
+      if (!current()) return
       if (found.length === 0) {
         logLine(`[${st.def.id}] 没发现到模型（原因见上一行，没有上一行就是接口返回了空列表），模型列表先用${(st.channelCtx.getConfig().discoveredModels?.length ?? 0) > 0 ? '上次保存的' : '内置兜底'}的`)
         return
       }
       st.discovered = { models: found, at: Date.now() }
       try {
-        await st.channelCtx.updateConfig({ discoveredModels: found })
+        // guard 在排队前后与真正写的那一刻都验：注销清列表要能压过这次发现
+        await st.channelCtx.updateConfig({ discoveredModels: found }, current)
       } catch (error) {
         logLine(`[${st.def.id}] 模型列表写回配置失败，本次运行照常用新列表，重启后会退回旧的：${(error as Error)?.message ?? error}`)
       }
+      if (!current()) return
       st.channelCtx.notifyModelsChanged()
       logLine(`[${st.def.id}] 已发现 ${found.length} 个订阅模型：${found.map((m) => m.id).join(', ')}`)
-    })().finally(() => {
-      st.discovering = undefined
-    })
-    return st.discovering
+    })()
+    st.discovering = { revision, promise }
+    // 只有仍是这次发现时才清 discovering：旧发现的 finally 不能清掉新的
+    const clear = (): void => {
+      if (st.discovering?.promise === promise) st.discovering = undefined
+    }
+    void promise.then(clear, clear)
+    return promise
   }
 
   async function logoutChannel(st: ChannelState): Promise<void> {
+    // 立刻作废在途发现（它们之后不会再写配置 / 注册），再真正注销。
+    st.revision += 1
     await st.runtime.logout()
     st.discovered = undefined
     // 注销后从模型列表移除该提供商（未登录不再占用模型选择器）。
-    st.syncRegistration?.(false)
+    if (!st.disposed) st.syncRegistration?.(false)
     try {
-      await st.channelCtx.updateConfig({ discoveredModels: [] })
+      await st.channelCtx.updateConfig({ discoveredModels: [] }, () => !st.disposed)
     } catch (error) {
       logLine(`清除模型列表失败: ${(error as Error)?.message ?? error}`)
     }
@@ -337,7 +357,13 @@ export function apply(ctx: Context, config: Record<string, ChannelConfigRef | un
   // ---------- 插件停止时中止所有进行中的登录会话与启动门控轮询 ----------
   ctx.effect(() => () => {
     for (const def of CHANNELS) gateStopped.set(def.id, true)
-    for (const st of states.values()) st.runtime.cancelLogin()
+    for (const st of states.values()) {
+      // 立即标记卸载 + 作废在途发现：之后不再写配置、不再注册 provider
+      st.disposed = true
+      st.revision += 1
+      st.runtime.cancelLogin()
+      st.tokenStore?.invalidate()
+    }
   }, 'subscription-auth.auth-cleanup')
 
   // ---------- 配置中心「订阅服务」页的 RPC 端点（Typert Gateway 的 /api 通道）----------

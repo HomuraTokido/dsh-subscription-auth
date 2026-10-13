@@ -283,7 +283,7 @@ function openedBrowsers() {
 }
 
 /** 把一个假的回调请求交给假 http 服务器（等价于浏览器跳回 localhost）。 */
-function deliverCallback(port, params, server = stubServer(port)) {
+function deliverCallback(port, params, server = stubServer(port), path = '/auth/callback') {
   assert.ok(server, `没有监听 ${port} 的回调服务器`)
   const res = {
     statusCode: 0,
@@ -291,13 +291,13 @@ function deliverCallback(port, params, server = stubServer(port)) {
     writeHead(code) { this.statusCode = code },
     end(body) { this.body = body || '' },
   }
-  server.emit('request', { url: `/auth/callback?${new URLSearchParams(params).toString()}` }, res)
+  server.emit('request', { url: `${path}?${new URLSearchParams(params).toString()}` }, res)
   return res
 }
 
 // ---------- 渠道 harness ----------
 
-function createHarness(channelModule, { redirectPort = 1455 } = {}) {
+function createHarness(channelModule, { channelId = 'chatgpt', redirectPort = 1455 } = {}) {
   const state = {
     token: undefined,
     written: [],
@@ -309,9 +309,16 @@ function createHarness(channelModule, { redirectPort = 1455 } = {}) {
     /** 一次性写入闸门：设上后第一次 writeToken 会挂在这里，直到 gate.resolve()。 */
     gate: null,
   }
+  /** 凭据写入串行（等价 TokenStore 的本地队列）：回滚一定排在后续写入之前。 */
+  let credentialQueue = Promise.resolve()
+  const serialize = (task) => {
+    const run = credentialQueue.then(task, task)
+    credentialQueue = run.then(() => undefined, () => undefined)
+    return run
+  }
   const ctx = {
-    id: 'chatgpt',
-    tokenRefName: 'CHATGPT_SUBSCRIPTION_TOKEN',
+    id: channelId,
+    tokenRefName: `${channelId.toUpperCase()}_SUBSCRIPTION_TOKEN`,
     options: () => ({
       apiBaseURL: 'https://chatgpt.com/backend-api/codex/responses',
       redirectPort,
@@ -327,7 +334,21 @@ function createHarness(channelModule, { redirectPort = 1455 } = {}) {
     log: (message) => state.logs.push(message),
     notifyModelsChanged: () => {},
     readToken: async () => state.token,
-    writeToken: async (next) => {
+    /** 读令牌，60 秒内过期先刷新（等价 TokenStore.fresh 的最小面）。 */
+    freshToken: async (refresh) => {
+      const token = state.token
+      if (!token) return undefined
+      if (token.expires - Date.now() >= 60_000) return token
+      const refreshed = await refresh(token, new AbortController().signal)
+      const merged = { ...refreshed, refresh: refreshed.refresh || token.refresh }
+      state.token = merged
+      state.written.push(merged)
+      state.events.push(`write:${merged.access}`)
+      return merged
+    },
+    /** 写入令牌：isCurrent 在落库前后各校验一次，取消时回滚自己刚写的那条。 */
+    writeToken: (next, isCurrent = () => true) => serialize(async () => {
+      if (!isCurrent()) return false
       const gate = state.gate
       state.gate = null
       state.events.push(`write-start:${next.access}`)
@@ -335,15 +356,22 @@ function createHarness(channelModule, { redirectPort = 1455 } = {}) {
       state.token = next
       state.written.push(next)
       state.events.push(`write:${next.access}`)
-    },
-    clearToken: async () => {
+      if (isCurrent()) return true
+      if (state.token === next) {
+        state.token = undefined
+        state.cleared += 1
+        state.events.push('clear')
+      }
+      return false
+    }),
+    clearToken: () => serialize(async () => {
       state.token = undefined
       state.cleared += 1
       state.events.push('clear')
-    },
+    }),
     afterLogin: () => { state.afterLoginCalls += 1 },
   }
-  return { state, ctx, runtime: channelModule.chatgptChannel.create(ctx) }
+  return { state, ctx, runtime: channelModule[`${channelId}Channel`].create(ctx) }
 }
 
 // ---------- 1. 回调监听器（真实 loopback，测试专用临时端口） ----------
@@ -1063,7 +1091,7 @@ async function testCancellationAndIsolation(channel) {
   console.log('✓ 5f. 被取消的在途写入先回滚、再写新尝试令牌（互不覆盖）')
 
   {
-    // 写凭据抛错：尽力清理可能写了一半的凭据，错误进 authStatus.error
+    // 写凭据抛错：错误进 authStatus.error，不写不 afterLogin（记录事务是原子的，无半截状态）
     resetHttpStub([])
     const harness = createHarness(channel)
     harness.ctx.writeToken = async () => { throw new Error('credential write failed') }
@@ -1074,10 +1102,10 @@ async function testCancellationAndIsolation(channel) {
     const status = await harness.runtime.authStatus()
     assert.match(status.error, /credential write failed/)
     assert.equal(harness.state.written.length, 0)
-    assert.equal(harness.state.cleared, 1, '写失败后尽力清理')
+    assert.equal(harness.state.cleared, 0, '原子写入失败不留半截状态，不需要清理')
     assert.equal(harness.state.afterLoginCalls, 0)
   }
-  console.log('✓ 5g. 写入凭据失败：尽力清理 + authStatus.error')
+  console.log('✓ 5g. 写入凭据失败：authStatus.error 可见，不写不 afterLogin')
 }
 
 // ---------- 6. 设备轮询边界（可控时钟，不真等 15 分钟） ----------
@@ -1337,6 +1365,147 @@ async function testInstanceIsolationAndCallbackReplay(channel) {
   console.log('✓ 7c. state 不匹配的回调：不写令牌 / 不开页面 / error 可见 / 端口释放')
 }
 
+// ---------- 8. 其它三个渠道：初始化取消 / 换令牌途中取消 / 错误显示 ----------
+
+async function testOtherChannelFlows(module_) {
+  {
+    // Grok：设备流取消 → 不写凭据；晚到的完成结果也不写、不请求 userinfo
+    resetHttpStub([])
+    let releasePoll
+    const calls = { userinfo: 0 }
+    globalThis.fetch = async (url) => {
+      const u = String(url)
+      if (u.endsWith('/.well-known/openid-configuration')) return json({ token_endpoint: 'https://auth.x.ai/oauth2/token' })
+      if (u.endsWith('/oauth2/device/code')) {
+        return json({ device_code: 'grok-dev', user_code: 'GROK-CODE', verification_uri_complete: 'https://x.ai/device', interval: 1, expires_in: 600 })
+      }
+      if (u.endsWith('/oauth2/token')) {
+        return await new Promise((resolve) => {
+          releasePoll = () => resolve(json({ access_token: 'grok-access', refresh_token: 'grok-refresh', expires_in: 600 }))
+        })
+      }
+      if (u.endsWith('/oauth2/userinfo')) {
+        calls.userinfo += 1
+        return json({ sub: 'grok-sub' })
+      }
+      throw new Error('unexpected ' + u)
+    }
+    const { runtime, state } = createHarness(module_, { channelId: 'grok' })
+    const result = await runtime.login()
+    assert.equal(result.userCode, 'GROK-CODE')
+    assert.equal((await runtime.authStatus()).status, 'pending')
+    runtime.cancelLogin()
+    assert.equal((await runtime.authStatus()).status, 'not-logged-in')
+    assert.equal((await runtime.authStatus()).error, undefined, '取消不算失败')
+    await waitFor(() => typeof releasePoll === 'function')
+    releasePoll()
+    await sleep(20)
+    assert.equal(state.written.length, 0, '取消后晚到的完成结果不得写凭据')
+    assert.equal(state.afterLoginCalls, 0)
+    assert.equal(calls.userinfo, 0, '取消后不再请求 userinfo')
+  }
+  console.log('✓ 8a. Grok 设备流：取消后晚到的完成结果不写凭据、不 afterLogin')
+
+  {
+    // Grok：初始化失败 → login 抛错 + authStatus.error
+    resetHttpStub([])
+    globalThis.fetch = async (url) => {
+      const u = String(url)
+      if (u.endsWith('/.well-known/openid-configuration')) return json({ token_endpoint: 'https://auth.x.ai/oauth2/token' })
+      if (u.endsWith('/oauth2/device/code')) return json({}, 500)
+      throw new Error('unexpected ' + u)
+    }
+    const { runtime, state } = createHarness(module_, { channelId: 'grok' })
+    await assert.rejects(runtime.login(), /设备码请求失败 \(HTTP 500\)/)
+    const status = await runtime.authStatus()
+    assert.equal(status.status, 'not-logged-in')
+    assert.match(status.error, /设备码请求失败 \(HTTP 500\)/)
+    assert.equal(state.written.length, 0)
+  }
+  console.log('✓ 8b. Grok：初始化失败抛给 UI 且进 authStatus.error')
+
+  {
+    // Kimi：换令牌在途时取消 → 不写；随后的重试进入新的 pending
+    resetHttpStub([])
+    let polls = 0
+    let releaseExchange
+    globalThis.fetch = async (url, init = {}) => {
+      const u = String(url)
+      if (u.endsWith('/api/oauth/device_authorization')) {
+        return json({ user_code: 'KIMI-CODE', device_code: 'kimi-dev', verification_uri_complete: 'https://kimi.test/device', expires_in: 600, interval: 1 })
+      }
+      if (u.endsWith('/api/oauth/token')) {
+        const grant = new URLSearchParams(init.body).get('grant_type') ?? ''
+        if (grant.includes('device_code')) {
+          polls += 1
+          if (polls === 1) return json({ error: 'authorization_pending' })
+          return await new Promise((resolve) => {
+            releaseExchange = () => resolve(json({ access_token: 'kimi-access', refresh_token: 'kimi-refresh', expires_in: 600 }))
+          })
+        }
+        return json({ access_token: 'kimi-access', refresh_token: 'kimi-refresh', expires_in: 600 })
+      }
+      throw new Error('unexpected ' + u)
+    }
+    const { runtime, state } = createHarness(module_, { channelId: 'kimi' })
+    const first = await runtime.login()
+    assert.equal(first.userCode, 'KIMI-CODE')
+    await waitFor(() => typeof releaseExchange === 'function', { timeout: 5000 })
+    runtime.cancelLogin()
+    releaseExchange()
+    await sleep(20)
+    assert.equal(state.written.length, 0, '取消后换到的令牌不得写入')
+    assert.equal(state.afterLoginCalls, 0)
+    const cancelled = await runtime.authStatus()
+    assert.equal(cancelled.status, 'not-logged-in')
+    assert.equal(cancelled.error, undefined, '取消不算失败')
+
+    const second = await runtime.login()
+    assert.equal(second.userCode, 'KIMI-CODE')
+    const retried = await runtime.authStatus()
+    assert.equal(retried.status, 'pending', '重试进入新的 pending')
+    assert.equal(retried.userCode, 'KIMI-CODE')
+    runtime.cancelLogin()
+  }
+  console.log('✓ 8c. Kimi：换令牌途中取消不写凭据，重试进入新的 pending')
+
+  {
+    // Claude：初始化取消；换令牌途中取消也不写凭据（回调服务器用假 http 的测试端口）
+    resetHttpStub([])
+    const port = 18671
+    let exchanges = 0
+    let releaseExchange
+    globalThis.fetch = async (url) => {
+      const u = String(url)
+      if (u.endsWith('/v1/oauth/token')) {
+        exchanges += 1
+        return await new Promise((resolve) => {
+          releaseExchange = () => resolve(json({ access_token: 'claude-access', refresh_token: 'claude-refresh', expires_in: 3600 }))
+        })
+      }
+      throw new Error('unexpected ' + u)
+    }
+    const { runtime, state } = createHarness(module_, { channelId: 'claude', redirectPort: port })
+    await runtime.login()
+    assert.equal((await runtime.authStatus()).status, 'pending')
+    runtime.cancelLogin()
+    assert.equal((await runtime.authStatus()).status, 'not-logged-in')
+    assert.equal(attemptedPorts().includes(port), true, 'Claude 在配置端口上等回调')
+
+    const second = await runtime.login()
+    const callbackState = new URL(second.url).searchParams.get('state')
+    assert.equal(deliverCallback(port, { code: 'claude-code', state: callbackState }, undefined, '/callback').statusCode, 200)
+    await waitFor(() => typeof releaseExchange === 'function')
+    runtime.cancelLogin()
+    releaseExchange()
+    await sleep(20)
+    assert.equal(state.written.length, 0, '取消后换到的令牌不得写入')
+    assert.equal(state.afterLoginCalls, 0)
+    assert.equal(exchanges, 1)
+  }
+  console.log('✓ 8d. Claude：初始化取消 + 换令牌途中取消都不写凭据')
+}
+
 async function main() {
   await rm(tmp, { recursive: true, force: true })
   await mkdir(tmp, { recursive: true })
@@ -1350,7 +1519,10 @@ async function main() {
     `export * from './src/oauth.ts'
 export * from './src/chatgpt-device-auth.ts'
 export * from './src/device-flow.ts'
-export { chatgptChannel, callbackPortCandidates } from './src/channels/chatgpt.ts'`,
+export { chatgptChannel, callbackPortCandidates } from './src/channels/chatgpt.ts'
+export { claudeChannel } from './src/channels/claude.ts'
+export { grokChannel } from './src/channels/grok.ts'
+export { kimiChannel } from './src/channels/kimi.ts'`,
     join(tmp, 'chatgpt.mjs'),
     [stubPlugin({ 'node:http': httpStubPath, 'node:child_process': childProcessStubPath })],
   )
@@ -1365,6 +1537,7 @@ export { chatgptChannel, callbackPortCandidates } from './src/channels/chatgpt.t
     await testCancellationAndIsolation(module_)
     await testDevicePollBoundaries(module_)
     await testInstanceIsolationAndCallbackReplay(module_)
+    await testOtherChannelFlows(module_)
     await sleep(150)
     assert.equal(unhandled.length, 0, `出现 unhandledRejection: ${unhandled.map(String).join(', ')}`)
     console.log('\nchatgpt-auth 全部通过 ✔')

@@ -22,6 +22,10 @@ import { createServer } from 'node:http'
 import type { Server } from 'node:http'
 import { createHash, randomBytes } from 'node:crypto'
 import { spawn } from 'node:child_process'
+import type { StoredToken } from './channel.js'
+
+/** 令牌形状统一由 channel.ts 定义（驱动与四个渠道共用一份）。 */
+export type { StoredToken }
 
 export const CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
 export const AUTH_BASE = 'https://auth.openai.com'
@@ -34,15 +38,6 @@ export const REQUEST_TIMEOUT_MS = 30 * 1000
 const SCOPES = 'openid profile email offline_access api.connectors.read api.connectors.invoke'
 /** omp（pi-coding-agent）的 originator 值。 */
 const ORIGINATOR = 'pi'
-
-/** 持久化在 credential 里的令牌（JSON 字符串）。 */
-export interface StoredToken {
-  refresh: string
-  access: string
-  /** epoch 毫秒。 */
-  expires: number
-  accountId?: string
-}
 
 function base64url(buf: Buffer): string {
   return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
@@ -212,18 +207,28 @@ export function exchangeCode(code: string, port: number, verifier: string): Prom
   return exchangeAuthorizationCode(code, callbackRedirectUri(port), verifier)
 }
 
-export async function refreshAccessToken(refresh: string): Promise<StoredToken> {
-  const res = await fetch(`${AUTH_BASE}/oauth/token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type: 'refresh_token',
-      refresh_token: refresh,
-      client_id: CLIENT_ID,
-    }).toString(),
-  })
-  if (!res.ok) throw new Error(`token refresh failed (HTTP ${res.status})`)
-  return toStoredToken(await readAuthJson(res, 'token refresh response is not valid JSON'), refresh)
+/**
+ * 刷新令牌（ChatGPT）。带 30 秒单请求超时，并与调用方取消信号合并；
+ * 失败只报 HTTP 状态码——响应体可能带令牌材料，不写进错误信息。
+ */
+export async function refreshAccessToken(refresh: string, signal?: AbortSignal): Promise<StoredToken> {
+  const request = boundedSignal(signal)
+  try {
+    const res = await fetch(`${AUTH_BASE}/oauth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: refresh,
+        client_id: CLIENT_ID,
+      }).toString(),
+      signal: request.signal,
+    })
+    if (!res.ok) throw new Error(`token refresh failed (HTTP ${res.status})`)
+    return toStoredToken(await readAuthJson(res, 'token refresh response is not valid JSON'), refresh)
+  } finally {
+    request.cleanup()
+  }
 }
 
 function escapeHtml(s: string): string {

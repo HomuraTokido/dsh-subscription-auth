@@ -7,9 +7,17 @@
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import { AnthropicMessagesAdapter } from '../adapters/anthropic.js'
 import type { AdapterModel } from '../adapter.js'
-import { generatePkce, openBrowser, waitForCallback } from '../oauth.js'
-import type { ChannelContext, ChannelDefinition, ChannelReasoning, ChannelRuntime } from '../channel.js'
+import { boundedSignal, generatePkce, openBrowser, readAuthJson, waitForCallback } from '../oauth.js'
+import type {
+  AuthStatus,
+  ChannelContext,
+  ChannelDefinition,
+  ChannelReasoning,
+  ChannelRuntime,
+  LoginResult,
+} from '../channel.js'
 import type { StoredToken } from '../channel.js'
+import { AuthSession } from '../auth-session.js'
 
 const CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
 const AUTHORIZE = 'https://claude.ai/oauth/authorize'
@@ -19,6 +27,13 @@ const CALLBACK_PATH = '/callback'
 const SCOPES =
   'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload'
 const RESOLVE_THRESHOLD_MS = 60_000
+/** 浏览器回调的等待上限。 */
+const LOGIN_TIMEOUT_MS = 10 * 60 * 1000
+
+/** `unknown` 错误的可读文本（catch 变量在 strict 下是 unknown，不能直接取 .message）。 */
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
 
 const defaultModels: AdapterModel[] = [
   { id: 'claude-opus-4-8', name: 'Claude Opus 4.8', contextWindow: 400_000 },
@@ -73,42 +88,57 @@ function buildAuthorizeUrl(port: number, challenge: string, state: string): stri
   return AUTHORIZE + '?' + params.toString()
 }
 
-async function exchangeClaudeCode(code: string, port: number, verifier: string): Promise<StoredToken> {
-  const res = await fetch(TOKEN_ENDPOINT, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      grant_type: 'authorization_code',
-      client_id: CLIENT_ID,
-      code,
-      state: verifier,
-      redirect_uri: redirectUri(port),
-      code_verifier: verifier,
-    }),
-  })
-  if (!res.ok) {
-    const text = await res.text().catch(() => '')
-    throw new Error('token exchange failed (HTTP ' + res.status + '): ' + text.slice(0, 240))
+async function exchangeClaudeCode(
+  code: string,
+  port: number,
+  verifier: string,
+  signal?: AbortSignal,
+): Promise<StoredToken> {
+  const request = boundedSignal(signal)
+  try {
+    const res = await fetch(TOKEN_ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        grant_type: 'authorization_code',
+        client_id: CLIENT_ID,
+        code,
+        state: verifier,
+        redirect_uri: redirectUri(port),
+        code_verifier: verifier,
+      }),
+      signal: request.signal,
+    })
+    // 失败只报 HTTP 状态码：响应体可能带令牌材料，不写进错误信息
+    if (!res.ok) throw new Error('token exchange failed (HTTP ' + res.status + ')')
+    return toStoredToken(await readAuthJson(res, 'token response is not valid JSON'), undefined)
+  } finally {
+    request.cleanup()
   }
-  return toStoredToken(await res.json(), undefined)
 }
 
-async function refreshClaudeToken(refresh: string): Promise<StoredToken> {
-  const res = await fetch(TOKEN_ENDPOINT, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'anthropic-beta': 'oauth-2025-04-20',
-      'User-Agent': 'anthropic-sdk-typescript/0.94.0 userOAuthProvider',
-    },
-    body: JSON.stringify({
-      grant_type: 'refresh_token',
-      client_id: CLIENT_ID,
-      refresh_token: refresh,
-    }),
-  })
-  if (!res.ok) throw new Error('token refresh failed (HTTP ' + res.status + ')')
-  return toStoredToken(await res.json(), refresh)
+async function refreshClaudeToken(refresh: string, signal?: AbortSignal): Promise<StoredToken> {
+  const request = boundedSignal(signal)
+  try {
+    const res = await fetch(TOKEN_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'anthropic-beta': 'oauth-2025-04-20',
+        'User-Agent': 'anthropic-sdk-typescript/0.94.0 userOAuthProvider',
+      },
+      body: JSON.stringify({
+        grant_type: 'refresh_token',
+        client_id: CLIENT_ID,
+        refresh_token: refresh,
+      }),
+      signal: request.signal,
+    })
+    if (!res.ok) throw new Error('token refresh failed (HTTP ' + res.status + ')')
+    return toStoredToken(await readAuthJson(res, 'token refresh response is not valid JSON'), refresh)
+  } finally {
+    request.cleanup()
+  }
 }
 
 async function fetchClaudeModels(access: string): Promise<AdapterModel[]> {
@@ -145,18 +175,15 @@ export const claudeChannel: ChannelDefinition = {
   reasoning: REASONING,
 
   create(ctx: ChannelContext): ChannelRuntime {
-    let controller: AbortController | undefined
-    let pending: { url: string } | undefined
+    const session = new AuthSession<{ url: string; userCode?: string }>({
+      log: ctx.log,
+      write: (token, isCurrent) => ctx.writeToken(token, isCurrent),
+      afterLogin: ctx.afterLogin,
+    })
 
     /** 读令牌，快过期就先刷新并写回；未登录返回 undefined。对话请求和模型发现共用。 */
-    const freshToken = async () => {
-      const token = await ctx.readToken()
-      if (!token) return undefined
-      if (token.expires - Date.now() >= RESOLVE_THRESHOLD_MS) return token
-      const refreshed = await refreshClaudeToken(token.refresh)
-      await ctx.writeToken(refreshed)
-      return refreshed
-    }
+    const freshToken = () =>
+      ctx.freshToken((token, signal) => refreshClaudeToken(token.refresh, signal))
 
     const adapter = new AnthropicMessagesAdapter({
       options: () => ({
@@ -185,56 +212,61 @@ export const claudeChannel: ChannelDefinition = {
     return {
       adapter,
 
-      async login() {
+      async login(): Promise<LoginResult> {
+        // 先同步作废旧尝试（abort + 清 pending/error），再做任何 await。
+        const attempt = session.begin()
         const existing = await ctx.readToken()
+        if (!attempt.isCurrent()) throw new Error('aborted')
         if (existing && existing.expires > Date.now() + RESOLVE_THRESHOLD_MS) {
+          session.settle(attempt)
           return { status: 'logged-in', account: existing.accountId }
         }
-        this.cancelLogin()
         const port = ctx.options().redirectPort
         const { verifier, challenge } = generatePkce()
         const state = verifier
         const url = buildAuthorizeUrl(port, challenge, state)
-        controller = new AbortController()
-        pending = { url }
-        waitForCallback(port, state, controller.signal, 10 * 60 * 1000, CALLBACK_PATH)
+        attempt.publish({ url })
+        void waitForCallback(port, state, attempt.signal, LOGIN_TIMEOUT_MS, CALLBACK_PATH)
           .then(async (code) => {
+            if (!attempt.isCurrent()) return
             ctx.log('收到授权回调，开始换取令牌…')
-            const token = await exchangeClaudeCode(code, port, verifier)
-            await ctx.writeToken(token)
-            ctx.log('登录成功' + (token.accountId !== undefined ? '（account: ' + token.accountId + '）' : '') + '，开始发现模型列表…')
-            ctx.afterLogin()
+            const token = await exchangeClaudeCode(code, port, verifier, attempt.signal)
+            await session.succeed(attempt, token)
           })
-          .catch((error) => {
-            if (controller && !controller.signal.aborted) ctx.log('登录失败: ' + (error?.message ?? error))
-          })
-          .finally(() => {
-            pending = undefined
-          })
+          .catch((error: unknown) => { session.fail(attempt, error) })
         openBrowser(url)
         return { status: 'pending', url }
       },
 
-      async authStatus() {
+      async authStatus(): Promise<AuthStatus> {
         const token = await ctx.readToken()
         if (token) {
           return { provider: ctx.id, status: 'logged-in', account: token.accountId, expiresAt: token.expires }
         }
-        if (pending && controller && !controller.signal.aborted) {
-          return { provider: ctx.id, status: 'pending', url: pending.url }
+        const pending = session.pending()
+        if (pending !== undefined) {
+          return {
+            provider: ctx.id,
+            status: 'pending',
+            url: pending.url,
+            ...(pending.userCode !== undefined ? { userCode: pending.userCode } : {}),
+          }
+        }
+        const error = session.lastError()
+        if (error !== undefined) {
+          return { provider: ctx.id, status: 'not-logged-in', error }
         }
         return { provider: ctx.id, status: 'not-logged-in' }
       },
 
       async logout() {
-        this.cancelLogin()
+        // 先 cancel（abort + 清 pending/error），再清凭据。
+        session.cancel()
         await ctx.clearToken()
       },
 
       cancelLogin() {
-        if (controller && !controller.signal.aborted) controller.abort()
-        controller = undefined
-        pending = undefined
+        session.cancel()
       },
 
       async discoverModels() {
@@ -243,7 +275,7 @@ export const claudeChannel: ChannelDefinition = {
           if (!token) return []
           return await fetchClaudeModels(token.access)
         } catch (error) {
-          ctx.log('模型列表发现失败: ' + (error?.message ?? error))
+          ctx.log('模型列表发现失败: ' + messageOf(error))
           return []
         }
       },

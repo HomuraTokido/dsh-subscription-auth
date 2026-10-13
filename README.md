@@ -1,139 +1,56 @@
 # dsh-subscription-auth
 
-[![npm version](https://img.shields.io/npm/v/dsh-subscription-auth)](https://www.npmjs.com/package/dsh-subscription-auth)
+给 DSH 和 DSR 增加订阅账号登录。此仓库由 [HomuraTokido](https://github.com/HomuraTokido/dsh-subscription-auth) 独立维护；原始出处和许可证见 [UPSTREAM.md](UPSTREAM.md)。本分叉当前通过源码/Git 安装，npm 上同名包不代表本仓库的最新实现。
 
-给 dsh 增加**订阅会员 OAuth 登录**支持（模型提供商按订阅账号登录，而不是 API key）。内置四个订阅渠道：
-
-| 渠道 | 登录方式 | 推理 API |
+| 渠道 | 登录方式 | 模型协议 |
 |---|---|---|
-| ChatGPT 订阅（Plus/Pro） | 授权码 + PKCE + localhost 回调 | codex Responses API |
-| Claude（Pro/Max） | 授权码 + PKCE + localhost 回调 | Anthropic Messages API |
-| Grok（SuperGrok / X Premium+） | RFC 8628 设备授权流 | xAI Responses API |
-| Kimi（Kimi Code） | RFC 8628 设备授权流 | Kimi Anthropic Messages API |
+| ChatGPT | 浏览器授权；本地回调不可用时自动用官方设备授权 | Codex Responses |
+| Claude | 浏览器授权与本地回调 | Anthropic Messages |
+| Grok | 设备授权 | xAI Responses |
+| Kimi | 设备授权 | Anthropic Messages |
 
-每个渠道是一个自包含模块（`src/channels/<id>.ts`，实现 `ChannelDefinition` 契约），`src/index.ts` 是薄的通用驱动（遍历渠道定义注册 settings / provider / adapter / 路由）。OAuth 常量与 wire 格式以 omp（`@oh-my-pi/pi-ai`、`@oh-my-pi/pi-catalog`）源码为准。对接方法见内置 skill：`subscription-channel-migration`。
+认证由插件负责，模型请求由宿主的 `@deepseek-ai/dsh-llm-pi-ai` / `@earendil-works/pi-ai` 负责。插件不再维护消息序列化、SSE 解析和思考签名重放的独立实现。
 
-## 渠道详情
+## 宿主要求
 
-| 环节 | ChatGPT | Claude | Grok | Kimi |
-|---|---|---|---|---|
-| 授权端点 | `https://auth.openai.com/oauth/authorize` | `https://claude.ai/oauth/authorize` | `https://auth.x.ai/oauth2/device/code` | `https://auth.kimi.com/api/oauth/device_authorization` |
-| 令牌端点 | `https://auth.openai.com/oauth/token` | `https://api.anthropic.com/v1/oauth/token` | （OIDC 发现 `https://auth.x.ai/.well-known/openid-configuration`） | `https://auth.kimi.com/api/oauth/token` |
-| `client_id` | `app_EMoamEEZ73f0CkXaXp7hrann` | `9d1c250a-e61b-44d9-88ed-5944d1962f5e` | `b1a00492-073a-47ea-816f-4c329264a828` | `17e5f671-d194-4dfb-9706-5516cb48c098` |
-| scope | `openid profile email offline_access api.connectors.read api.connectors.invoke` | `org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload` | `openid profile email offline_access grok-cli:access api:access` | （设备流，无 scope） |
-| 回调 | `http://localhost:1455/auth/callback`（被占用时改 1457；两个都占不到则退回官方设备授权） | `http://localhost:54545/callback` | 设备流（无回调） | 设备流（无回调） |
-| 调用端点 | `https://chatgpt.com/backend-api/codex/responses` | `https://api.anthropic.com/v1/messages` | `https://api.x.ai/v1/responses` | `https://api.kimi.com/coding/v1/messages` |
+使用 DSH 0.2.1 alpha 系列的原生凭据记录与事务接口，或提供相同接口的 DSR。具体依赖契约以 `package.json` 为准；不再宣称兼容尚无 `CredentialProvider.modifyRecord` 的旧宿主。
 
-**登录时**：授权码渠道（ChatGPT / Claude）生成 PKCE 挑战 → 用 `rundll32` 打开浏览器（**不能用 `cmd /c start`**：URL 里的 `&` 会被截断）→ 本地一次性 HTTP 服务器（只监听 `127.0.0.1`）收 `code`+`state`（10 分钟超时）→ 换令牌 → 存进 credential 服务。ChatGPT 只试 OpenAI 注册过的两个回调端口 **1455 / 1457**（配置里指定其中之一则优先；只有 `EACCES` / `EADDRINUSE` 才换下一个，不做任意端口兜底），端口真的绑定成功后才打开浏览器；两个端口都占不到时自动退回 **官方设备授权**（`https://auth.openai.com/codex/device` 输入授权码，15 分钟过期）。设备流渠道（Grok / Kimi）请求设备码 → 打开验证页并展示授权码 → 后台轮询直到用户完成授权 → 存令牌。之后每次请求前检查 access token 快过期则静默续期。
+需要 Node.js 20 或更新版本，以及宿主的 LLM、credentials、settings、PiAiAdapter 服务包。图片输入需要宿主 attachment 服务。宿主没有附件服务或模型不支持图片时，适配器给出明确错误。
 
-## 安装
-
-**前置**：已装好 DSH（`dsh web` 能正常运行），Node.js ≥ 20，`pnpm` 可用（`dsh plugin add` 内部使用；没有的话先 `npm install -g pnpm`）。
-
-### 标准安装（npm 发布，推荐）
-
-插件以 npm 包 `dsh-subscription-auth` 发布，包内声明了 `dsh.bundle.patch`（随包的 `cordis.patch.yml`）：CLI 安装后会自动注册进 profile 的 `dsh.profile.bundles`，下次启动即挂载——**一条命令完成安装与挂载，无需手改任何配置文件**：
+## 构建与验证
 
 ```sh
-dsh plugin --profile web add dsh-subscription-auth
+git clone https://github.com/HomuraTokido/dsh-subscription-auth.git
+cd dsh-subscription-auth
+npm ci
+npm run typecheck
+npm run build
+npm test
 ```
 
-装完**重启 dsh** 并**硬刷新浏览器**（Cmd/Ctrl+Shift+R）。
+构建使用 Node.js 和 esbuild，将 `src` 转为 `lib` 并生成公开声明类型。`lib/client.js` 是独立维护的设置页，不会被构建覆盖。历史 Bun/shell 构建脚本不是当前入口。
 
-> 若报 `minimum release age`（发布不足 24h 的新版本）：等 24h，或直接重跑一次上面的命令（pnpm 会自动补 `minimumReleaseAgeExclude` 放行）。
+不要在已经链接到运行中宿主 `node_modules` 的源码目录执行依赖安装。先在独立检出中构建、测试，再按宿主自己的插件安装与重载流程加载包。DSR 的主备实例也应通过自身生命周期入口更新。
 
-**更新**：
+## 登录与使用
 
-```sh
-dsh plugin --profile web add dsh-subscription-auth
-```
+打开 **设置 → 订阅服务**，选择渠道并点击登录。设备流会展示验证链接和授权码。完成授权后，插件保存凭据、发现模型，模型选择器才注册该渠道。注销会清除本地凭据和自动发现的列表。
 
-### 从旧版本迁移（手动挂载 → npm 通道）
+ChatGPT 在打开浏览器之前实际绑定 `127.0.0.1` 的回调监听，只使用 OpenAI 注册的 **1455 / 1457**。配置指定其中一个时优先使用它；遇到 `EACCES` 或 `EADDRINUSE` 才换另一个。两个端口都不可用时，直接展示 [官方设备授权页](https://auth.openai.com/codex/device) 与授权码，不需要用户修改 Windows 端口保留或防火墙配置。其他监听失败会显示具体错误。
 
-0.2.1 之前（或任何通过「源码目录 junction + 手动挂载行」安装的版本）升级到 npm 通道，**按顺序**执行：
+Claude 回调端口默认 54545。Grok/Kimi 不依赖本地回调。回调与设备授权各有有效期，网络请求有独立超时；取消或重试会立即作废旧尝试，旧授权结果不能覆盖新登录。
 
-1. **删除 profile 里的手动挂载行**：编辑 `~/.dsh/profiles/web/cordis.patch.yml`（早期按全局文档安装的可能是 `~/.dsh/cordis.patch.yml`），删除这一段：
+四个渠道使用共享认证生命周期。快过期的访问令牌通过宿主凭据事务刷新，并发请求共用刷新结果。注销、取消和卸载会阻止迟到的授权、刷新或模型发现重新写回状态。错误会在设置页显示；日志不写令牌或授权响应片段。
 
-   ```yaml
-   - insert:
-       - id: dsh-subscription-auth
-         name: dsh-subscription-auth
-   ```
+## 凭据迁移
 
-2. **删除插件锚点 junction**（Windows）：
+首次读取时，将旧的 `*_SUBSCRIPTION_TOKEN` JSON 令牌迁移为插件自己的原生 credential record。先成功提交新记录，再移除旧引用；已有有效记录优先，不能被旧引用覆盖。新记录无法提交时保留旧引用并报告错误；新记录已提交而旧引用清理失败时保留两者，并写安全日志。正常迁移无需重新登录。
 
-   ```powershell
-   cmd /c rmdir "$HOME\.dsh\profiles\node_modules\dsh-subscription-auth"
-   ```
+凭据仍由宿主 credentials 服务管理，插件没有第二份 `auth.json`，也不向 PiAiAdapter 的环境发现暴露其他应用的凭据。
 
-3. **用官方 CLI 安装 npm 版**：
+## 模型与配置
 
-   ```powershell
-   dsh plugin --profile web add dsh-subscription-auth
-   ```
-
-4. **重启 dsh + 硬刷新**（Cmd/Ctrl+Shift+R）。
-
-> ⚠️ 迁移要点：
-> - **令牌不受影响**：登录令牌存在 credential 服务里，与安装方式无关——迁移后**无需重新登录**。
-> - **不要跳过第 1、2 步**：旧挂载不删就装 npm 版会**双挂载**（两个 Node 半、设置页出现两个「订阅服务」）。
-> - 旧的源码克隆目录可留作开发（见下），或直接删除；本机开发用的 `node_modules` junction 与运行无关。
-
-### 源码安装 / 开发（可选，替代 npm 方式）
-
-调试本地改动或跟随开发分支时使用（**仅在未通过 npm 通道安装时使用**，否则会与 npm 版双挂载）：
-
-```text
-1. git clone https://github.com/Khellendros97/dsh-subscription-auth.git
-   cd dsh-subscription-auth && bun scripts/build-bun.mjs   # 递归转译 src → lib
-2. 依赖解析：把 running dsh 的依赖指进来（Windows 示例）：
-   cmd /c mklink /J "$HOME\dsh-plugins\dsh-subscription-auth\node_modules" "<dsh 安装目录>\node_modules\@deepseek-ai\dsh\node_modules"
-3. 注册到插件锚点：
-   cmd /c mklink /J "$HOME\.dsh\profiles\node_modules\dsh-subscription-auth" "$HOME\dsh-plugins\dsh-subscription-auth"
-4. 在 ~/.dsh/profiles/web/cordis.patch.yml 追加：
-   - insert:
-       - id: dsh-subscription-auth
-         name: "dsh-subscription-auth"
-5. 重启 dsh。
-```
-
-更新：`git pull && bun scripts/build-bun.mjs` → 重启 dsh。切回 npm 通道时：删除锚点 junction 与手动挂载行，再 `dsh plugin --profile web add dsh-subscription-auth`。
-
-## 使用
-
-1. 打开 **设置 → 订阅服务**：列出四个订阅提供商，显示登录状态、账号与可用模型（折叠列表）。
-
-2. 点「登录」：
-   - **ChatGPT / Claude**：浏览器自动打开授权页 → 登录并授权 → 跳回 localhost 回调（ChatGPT 用 1455，被占用时用 1457）→ 页面轮询到「已登录」→ 自动拉取官方模型列表。ChatGPT 在这两个端口都不可用时改为显示官方设备授权码（同 Grok / Kimi 的交互）。
-   - **Grok / Kimi**：页面显示验证链接 + 设备授权码 → 在浏览器打开链接并输入代码 → 页面轮询到「已登录」→ 自动拉取模型列表。
-
-   登录失败时卡片里会直接显示原因（设备码请求 / 轮询 / 换令牌的错误都会记到下一次「订阅服务」页刷新）。
-
-3. 在模型选择里切到对应的提供商（如「Claude (订阅)」），选一个模型即可对话。
-
-   模型选择器可为订阅模型选择**思考强度（推理等级）**：
-   - ChatGPT：`minimal / low / medium / high`（默认 `medium`，作为 codex Responses 的 `reasoning.effort` 发送）
-   - Claude：`low / medium / high`（默认 `medium`，映射为 extended thinking 的 `budget_tokens` 8192 / 16384 / 32000）
-   - Grok：`low / medium / high`（不设默认，选择后作为 xAI Responses 的 `reasoning.effort` 发送）
-   - Kimi：`low / medium / high`（不设默认，映射为 `thinking.budget_tokens` 4096 / 16384 / 32768）
-
-   不选择时走提供商默认行为（请求体不带思考参数）。
-
-4. 点右上角「注销」删除已保存的令牌与模型列表。
-
-> 注意：授权码渠道（ChatGPT / Claude）需要在本机运行 dsh，因为回调落在 `127.0.0.1`。
-
-> 注意：**未登录的提供商不会出现在模型选择器里**（provider/adapter 按登录状态注册）：登录成功后才注册进模型列表，注销后自动移除。设置 → 订阅服务 页始终列出全部四个渠道以便登录。
-
-> 注意：**已登录的提供商在 dsh 启动时即自动注册并发现模型**（启动门控会等待 credential 服务就绪；访问令牌过期时先用 refresh token 刷新再发现），无需先进入设置页。
-
-## 配置
-
-配置写在本插件 profile 条目的 `config` 下，每个渠道一段（`chatgpt` / `claude` / `grok` / `kimi`），
-整段声明为 volatile：core 0.2 的配置中心可以直接编辑，插件自己写回发现结果也走这条路
-（`configEditor` 落到当前 profile 的 `cordis.patch.yml`），改动不需要重启。模型优先级：
-手动 `models` → 本次运行发现的列表 → 上次写回的 `discoveredModels` → 渠道内置兜底列表。
-订阅服务页的「可用模型」标题会注明列表不是本次官方发现时的来源。
+每渠道配置放在插件条目的 `config` 下，支持运行时更新。模型列表优先级为：手动 `models` → 本次发现 → 上次保存的 `discoveredModels` → 内置默认列表。提供商返回的模型与用户手动模型仍使用原来的渠道 ID，不自动替换模型或新增账号池。
 
 ```yaml
 - id: dsh-subscription-auth
@@ -155,50 +72,24 @@ dsh plugin --profile web add dsh-subscription-auth
       maxTokens: 32768
 ```
 
-ChatGPT 渠道的模型发现要带 codex 客户端版本号，后端按它决定发哪些模型（老版本号看不到
-新模型）。插件每次发现前去 `registry.npmjs.org/@openai/codex/latest` 查最新版（6 小时内
-复用），查不到退回上次查到的版本，再退回代码里的 `CLIENT_VERSION`。要钉死某个版本时配
-`clientVersion`，它优先于自动查询：
+手动模型可以指定上下文窗口：
 
 ```yaml
     chatgpt:
-      clientVersion: "0.159.3"
-```
-
-`models` 可手动固定模型列表（可选；不配则用登录后自动发现的官方列表），例如：
-
-```yaml
-    claude:
       models:
-        - { id: claude-sonnet-5, name: Claude Sonnet 5, contextWindow: 1000000 }
+        - id: your-model-id
+          name: Your model
+          contextWindow: 1000000
 ```
 
-## 检测（日志）
+模型的推理档位、思考预算、图片能力和请求格式由渠道配置与 SDK 的模型信息共同确定。支持输出上限的协议中，请求显式指定的值优先于渠道配置。Codex 端点拒绝该参数，和之前的实现一样不发送。Claude 的自适应思考与思考签名交由 SDK 处理。
 
-```powershell
-Get-Content "$HOME\.dsh\tmp\subscription-auth.log"   # 插件日志（登录/发现/版本查询/错误）
-Select-String -Path "$env:DSH_HOME\profiles\<profile>\cordis.patch.yml" -Pattern "dsh-subscription-auth" -Context 0,20  # 写回的配置
-```
+ChatGPT 模型发现会从 npm 查询 Codex 客户端版本，6 小时内复用，失败回退已有值。需要指定版本时设置 `chatgpt.clientVersion`。
 
-## 测试
+## 测试范围
 
-```sh
-bun tests/smoke.mjs      # 依赖解析 / PKCE / Responses+Anthropic 序列化 / SSE 翻译 / 错误映射 / localhost 回调 / 多渠道 apply 接线 / 路由注册
-bun tests/lib-check.mjs  # 验证 lib/*.js 产物与 src/*.ts 行为一致
-node --check lib/client.js  # 配置中心页语法检查
-```
-
-## 已知限制
-
-- 各渠道模型列表以**登录后自动发现**为准（官方 `/models` 接口），手动 `models` 配置可覆盖；
-- Anthropic 订阅的 OAuth 授权约 30 天过期（refresh 不延长授权期），过期后需重新登录；
-- 登录令牌存于 credential 服务，属于本机敏感信息，请勿外传；
-- 并发刷新存在极小的重复续期竞争，但两者都会写入等价的新令牌，无副作用。
-
-## 扩展新渠道
-
-参考 skill `subscription-channel-migration`（对接订阅渠道的一般方法，含 omp 源码迁移指引）：在 `src/channels/<id>.ts` 实现 `ChannelDefinition`（OAuth 登录 + 模型发现 + 适配器），再把它加入 `src/index.ts` 的 `CHANNELS` 数组即可。
+CI 在 Windows/Linux 的 Node.js 24 上执行干净依赖安装、类型检查、构建和测试。回归用例覆盖回调端口不可用、设备授权、取消/重试交错、凭据迁移、刷新/注销竞争、模型发现迟到，以及通过真实适配器与 SDK 的模型请求和流式错误解析。测试使用合成凭据与模拟网络，不调用真实订阅服务。
 
 ## License
 
-BSD-3-Clause
+BSD-3-Clause。原作者版权声明保留在 `LICENSE` 中。宿主适配器和 SDK 作为依赖使用，遵循各自许可证。

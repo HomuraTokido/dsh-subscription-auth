@@ -40,13 +40,34 @@ function freshHarness(tokens = {}, credReadyAt = 0) {
   const disposers = []
   let credReady = credReadyAt <= 0
   if (credReadyAt > 0) setTimeout(() => { credReady = true }, credReadyAt)
+  /**
+   * 真实 credential mock：引用半边（resolve/set/unset）留给旧令牌迁移，
+   * 记录半边（readRecord/modifyRecord/deleteRecord）带串行事务语义——
+   * modifyRecord 的 mutate 看到当前记录，返回 undefined 表示不改。
+   */
+  const records = new Map()
+  let recordQueue = Promise.resolve()
   const mockCred = {
     resolve: async (ref) => {
       const raw = tokens[String(ref)]
       return raw === undefined ? undefined : { value: raw }
     },
-    set: async () => {},
-    unset: async () => {},
+    set: async (ref, value) => { tokens[String(ref)] = value },
+    unset: async (ref) => { delete tokens[String(ref)] },
+    readRecord: async (key) => records.get(String(key)),
+    modifyRecord: async (key, mutate) => {
+      const run = recordQueue.then(async () => {
+        const next = await mutate(records.get(String(key)))
+        if (next !== undefined) records.set(String(key), next)
+        return records.get(String(key))
+      })
+      recordQueue = run.then(() => undefined, () => undefined)
+      return run
+    },
+    deleteRecord: async (key) => { records.delete(String(key)) },
+    /** 测试观察用。 */
+    recordOf: (key) => records.get(String(key)),
+    legacyRefs: () => Object.keys(tokens),
   }
   const mockCtx = {
     fiber: { entry },
@@ -105,7 +126,7 @@ function freshHarness(tokens = {}, credReadyAt = 0) {
       },
     },
   }
-  return { calls, mockCtx, disposers }
+  return { calls, mockCtx, mockCred, disposers }
 }
 
 const waitSettle = () => new Promise((r) => setTimeout(r, 60))
@@ -266,6 +287,89 @@ const waitSettle = () => new Promise((r) => setTimeout(r, 60))
     assert.equal(requested.filter((u) => u.includes('/codex/models')).length, 1, '门控和设置页同时触发，只发一次发现请求')
     assert.deepEqual(calls.savedConfig?.chatgpt?.discoveredModels?.map((m) => m.id), ['gpt-6.1-sol'], '发现结果经 configEditor 写回 chatgpt 段')
     console.log('✓ E. 过期令牌：先刷新，按 codex 最新版发现，写回配置，设置页显示新列表')
+  } finally {
+    globalThis.fetch = offline
+  }
+}
+
+// ============ 场景 F：发现迟到时 logout 已经清列表（guard 行为证明） ============
+// 注销会把 revision 推前：在途发现拿到结果后不得再写回模型列表，也不得重新注册 provider。
+{
+  const token = JSON.stringify({ refresh: 'r', access: 'a', expires: Date.now() + 3600_000 })
+  const { calls, mockCtx } = freshHarness({ CHATGPT_SUBSCRIPTION_TOKEN: token })
+  const offline = globalThis.fetch
+  let releaseModels
+  let wrote = 0
+  globalThis.fetch = async (url) => {
+    const u = String(url)
+    const json = (body) => new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })
+    if (u.includes('/oauth/token')) return json({ access_token: 'fresh', expires_in: 3600 })
+    if (u.startsWith('https://registry.npmjs.org/')) return json({ version: '0.160.0' })
+    if (u.includes('/codex/models')) {
+      wrote += 1
+      await new Promise((resolve) => { releaseModels = resolve })
+      return json({ models: [{ slug: 'gpt-6.1-sol', visibility: 'list', context_window: 272000 }] })
+    }
+    throw new Error(`unexpected fetch ${u}`)
+  }
+  try {
+    plugin.apply(mockCtx)
+    await waitSettle()
+    while (releaseModels === undefined) await new Promise((r) => setTimeout(r, 5))
+
+    const instance = new calls.plugins[0]({ reflect: { provide: () => {} } })
+    await instance.logout('chatgpt')
+    const afterLogout = JSON.parse(JSON.stringify(calls.savedConfig?.chatgpt?.discoveredModels ?? null))
+
+    releaseModels() // 迟到的发现结果
+    await new Promise((r) => setTimeout(r, 40))
+
+    assert.deepEqual(
+      calls.savedConfig?.chatgpt?.discoveredModels ?? null,
+      afterLogout,
+      '注销后的迟到发现不得再写回模型列表',
+    )
+    assert.deepEqual(afterLogout, [], '注销把列表清成了空')
+    assert.ok(calls.providerReplaces.every((list) => list.length === 0), '注销后不得重新注册 provider')
+    console.log('✓ F. 发现迟到 + 已注销：不再写配置、不再注册（revision guard 的行为证明）')
+  } finally {
+    globalThis.fetch = offline
+  }
+}
+
+// ============ 场景 G：插件卸载后迟到的发现不得写配置 / 注册 ============
+{
+  const token = JSON.stringify({ refresh: 'r', access: 'a', expires: Date.now() + 3600_000 })
+  const { calls, mockCtx, disposers } = freshHarness({ CHATGPT_SUBSCRIPTION_TOKEN: token })
+  const offline = globalThis.fetch
+  let releaseModels
+  globalThis.fetch = async (url) => {
+    const u = String(url)
+    const json = (body) => new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })
+    if (u.includes('/oauth/token')) return json({ access_token: 'fresh', expires_in: 3600 })
+    if (u.startsWith('https://registry.npmjs.org/')) return json({ version: '0.160.0' })
+    if (u.includes('/codex/models')) {
+      await new Promise((resolve) => { releaseModels = resolve })
+      return json({ models: [{ slug: 'gpt-6.1-sol', visibility: 'list', context_window: 272000 }] })
+    }
+    throw new Error(`unexpected fetch ${u}`)
+  }
+  try {
+    plugin.apply(mockCtx)
+    await waitSettle()
+    while (releaseModels === undefined) await new Promise((r) => setTimeout(r, 5))
+
+    // 卸载：跑 effect teardown（置 disposed + revision++ + cancelLogin）
+    for (const dispose of disposers) dispose()
+    const configBefore = JSON.parse(JSON.stringify(calls.savedConfig ?? null))
+    const replacesBefore = calls.providerReplaces.length
+
+    releaseModels()
+    await new Promise((r) => setTimeout(r, 40))
+
+    assert.deepEqual(JSON.parse(JSON.stringify(calls.savedConfig ?? null)), configBefore, '卸载后不得再写配置')
+    assert.equal(calls.providerReplaces.length, replacesBefore, '卸载后不得再注册 / 撤销 provider')
+    console.log('✓ G. 卸载后迟到的发现：不再写配置、不再注册')
   } finally {
     globalThis.fetch = offline
   }

@@ -1,0 +1,138 @@
+/**
+ * 多订阅渠道抽象：统一每个订阅提供商的 OAuth 登录、模型发现与适配器，
+ * 让 src/index.ts 成为一个薄的通用驱动（遍历渠道定义并接线）。
+ * @module dsh-subscription-auth/channel
+ */
+import type { LlmAdapter } from '@deepseek-ai/dsh-llm';
+import type { CredentialProvider } from '@deepseek-ai/dsh-credentials';
+import type { AttachmentStore } from '@deepseek-ai/dsh-attachment';
+import type { AdapterModel } from './adapter.js';
+/** 思考强度档位（模型选择器「推理等级」菜单的一项）。 */
+export interface ReasoningEffort {
+    /** 档位 id：OpenAI/xAI Responses API 直接作为 reasoning.effort 发送。 */
+    id: string;
+    name: string;
+    description?: string;
+    /** Anthropic 系渠道（Claude/Kimi）：该档位对应的 thinking budget_tokens。 */
+    budgetTokens?: number;
+}
+/** 渠道级思考强度配置；缺省表示该渠道不提供思考强度选择。 */
+export interface ChannelReasoning {
+    efforts: ReasoningEffort[];
+    /** 缺省档位；缺省时 UI 提供 "Default"（不发送，用提供商默认行为）。 */
+    defaultEffort?: string;
+}
+/** 持久化在 credential 里的令牌（JSON 字符串）。 */
+export interface StoredToken {
+    refresh: string;
+    access: string;
+    /** epoch 毫秒。 */
+    expires: number;
+    accountId?: string;
+    email?: string;
+    [key: string]: unknown;
+}
+/**
+ * 刷新回调：拿到「当前令牌 + 取消信号」，返回刷新后的令牌。
+ * 信号必须贯通到 HTTP 请求（30 秒 boundedSignal），注销要能把它打断。
+ */
+export type RefreshToken = (token: StoredToken, signal: AbortSignal) => Promise<StoredToken>;
+/** 渠道的配置：插件 Config 里的 `<id>` 段（volatile，经 configEditor 写回 profile）。 */
+export interface ChannelConfig {
+    apiBaseURL?: string;
+    redirectPort?: number;
+    /** 用户手动指定的模型列表（优先于登录后自动发现的结果）。 */
+    models?: AdapterModel[];
+    defaultContextWindow?: number;
+    maxTokens?: number;
+    /** 模型发现请求携带的客户端版本号；后端按它决定发哪些模型。不配则每次去 npm 查 codex 最新版。 */
+    clientVersion?: string;
+    /** 登录后自动发现并持久化的官方模型列表（插件自己写，手改会被下次发现覆盖）。 */
+    discoveredModels?: AdapterModel[];
+}
+export interface ResolvedChannelOptions {
+    apiBaseURL: string;
+    redirectPort: number;
+    models: AdapterModel[];
+    defaultContextWindow: number;
+    maxTokens: number;
+    clientVersion?: string;
+}
+export interface LoginResult {
+    status: 'logged-in' | 'pending';
+    url?: string;
+    userCode?: string;
+    account?: string;
+}
+export interface AuthStatus {
+    provider: string;
+    status: 'logged-in' | 'pending' | 'not-logged-in';
+    account?: string;
+    expiresAt?: number;
+    url?: string;
+    userCode?: string;
+    /** 最近一次登录失败的原因（未登录时才有）；重试 / 注销后清空。 */
+    error?: string;
+}
+/** 通用驱动注入给每个渠道的依赖。 */
+export interface ChannelContext {
+    readonly id: string;
+    readonly tokenRefName: string;
+    /** 解析后的运行时配置（模型优先级已处理）。 */
+    options(): ResolvedChannelOptions;
+    /** settings 里尚未合并默认值的原始配置。 */
+    getConfig(): ChannelConfig;
+    /** 持久化配置片段（如 discoveredModels）；guard 在真正写的那一刻再验一次。 */
+    updateConfig(patch: ChannelConfig, guard?: () => boolean): Promise<void>;
+    credentials(): CredentialProvider | undefined;
+    /** 附件服务（读取用户上传的图片等）；宿主未安装该服务时返回 undefined。 */
+    attachments(): AttachmentStore | undefined;
+    log(message: string): void;
+    /** 触发 llm/adapters-updated，让模型选择器等 UI 重新拉取列表。 */
+    notifyModelsChanged(): void;
+    /** 读取本渠道的令牌（不存在/损坏返回 undefined）。 */
+    readToken(): Promise<StoredToken | undefined>;
+    /**
+     * 读令牌，快过期（<60s）先刷新并写回；未登录返回 undefined。
+     * 驱动侧实现为 credential 记录事务：跨进程串行，本地并发共享同一次刷新。
+     */
+    freshToken(refresh: RefreshToken): Promise<StoredToken | undefined>;
+    /**
+     * 写入本渠道令牌；`isCurrent` 在真正落库前再校验一次（返回 false 就丢弃这次写入）。
+     * 返回是否成功落库（取消 / 被新尝试接管时为 false）。
+     */
+    writeToken(token: StoredToken, isCurrent?: () => boolean): Promise<boolean>;
+    /** 删除本渠道令牌。 */
+    clearToken(): Promise<void>;
+    /** 登录成功后的后续动作（驱动实现为触发模型发现 + 重新注册 provider）。 */
+    afterLogin(): void;
+}
+export interface ChannelRuntime {
+    adapter: LlmAdapter;
+    /** 启动登录：立即返回（浏览器流给出 url，设备流给出 url+userCode）。 */
+    login(): Promise<LoginResult>;
+    authStatus(): Promise<AuthStatus>;
+    logout(): Promise<void>;
+    /** 中止进行中的登录会话（回调服务器 / 设备轮询）并清掉 pending 状态。 */
+    cancelLogin(): void;
+    /** 拉取官方模型列表；失败返回空数组（调用方回退默认列表）。 */
+    discoverModels(): Promise<AdapterModel[]>;
+}
+export interface ChannelDefinition {
+    id: string;
+    /** 注册进 llm 的 provider id 与显示名（模型选择器里显示）。 */
+    displayName: string;
+    /** 配置中心「订阅服务」卡片标题。 */
+    name: string;
+    description: string;
+    /** credential 服务里存令牌的 key。 */
+    tokenRefName: string;
+    defaultApiBaseURL: string;
+    defaultRedirectPort: number;
+    defaultContextWindow: number;
+    defaultMaxTokens: number;
+    defaultModels: AdapterModel[];
+    /** 思考强度选项（缺省不提供）。登录后发现的模型同样继承渠道级档位。 */
+    reasoning?: ChannelReasoning;
+    create(ctx: ChannelContext): ChannelRuntime;
+}

@@ -1,6 +1,6 @@
 /**
- * 验证 bun 转译产物 lib/*.js 与 src/*.ts 等价（加载 + 关键行为）。
- * 运行：bun tests/lib-check.mjs
+ * 验证 Node 构建产物 lib/*.js 与 src/*.ts 等价（加载 + 关键行为）。
+ * 运行：node tests/lib-check.mjs
  */
 import assert from 'node:assert'
 
@@ -20,23 +20,43 @@ assert.ok(url.startsWith('https://auth.openai.com/oauth/authorize?'))
 assert.ok(url.includes('client_id=app_EMoamEEZ73f0CkXaXp7hrann'))
 
 // ---------- Responses 适配器行为（mock fetch 一次流式调用） ----------
+// 原生 pi-ai 适配器按“已配置模型”解析请求，所以这里必须把要流的模型声明进列表。
 const adapterMod = await import('../lib/adapter.js')
 const llm = await import('@deepseek-ai/dsh-llm')
+/** 合成 JWT（无真实秘密）：codex 路由要求 access token 带 chatgpt_account_id 声明。 */
+function syntheticJwt(accountId = 'test-account') {
+  const segment = (value) => Buffer.from(JSON.stringify(value)).toString('base64')
+  return [
+    segment({ alg: 'none', typ: 'JWT' }),
+    segment({ 'https://api.openai.com/auth': { chatgpt_account_id: accountId }, sub: 'test-sub' }),
+    'test-signature',
+  ].join('.')
+}
+const LIB_ACCESS = syntheticJwt()
 globalThis.fetch = async () => {
   const stream = new ReadableStream({
     start(c) {
+      // 每个事件的 data 都带真实 type；终态 response 带完整 output，否则 SDK 报空响应
       c.enqueue(new TextEncoder().encode(
-        'event: response.output_text.delta\ndata: {"delta":"ok","output_index":0}\n\n' +
-        'event: response.completed\ndata: {"response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}\n\n',
+        'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_lib","status":"in_progress"}}\n\n' +
+        'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_lib","role":"assistant"}}\n\n' +
+        'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"ok","output_index":0}\n\n' +
+        'event: response.output_item.done\ndata: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_lib","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok","annotations":[]}]}}\n\n' +
+        'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_lib","status":"completed","output":[{"type":"message","id":"msg_lib","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok","annotations":[]}]}],"usage":{"input_tokens":1,"output_tokens":1}}}\n\n',
       ))
       c.close()
     },
   })
-  return new Response(stream, { status: 200 })
+  return new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } })
 }
 const adapter = new adapterMod.ChatGptAdapter({
-  options: () => ({ apiBaseURL: 'https://chatgpt.com/backend-api/codex/responses', maxTokens: 8192, models: [], defaultContextWindow: 400000 }),
-  resolveAccessToken: async () => ({ access: 't' }),
+  options: () => ({
+    apiBaseURL: 'https://chatgpt.com/backend-api/codex/responses',
+    maxTokens: 8192,
+    models: [{ id: 'gpt-5.5', name: 'GPT-5.5', contextWindow: 400_000 }],
+    defaultContextWindow: 400000,
+  }),
+  resolveAccessToken: async () => ({ access: LIB_ACCESS }),
 })
 const chunks = []
 for await (const c of adapter.stream({ provider: 'chatgpt', model: 'gpt-5.5', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })) {
@@ -66,7 +86,13 @@ globalThis.fetch = async () => {
   return new Response(stream, { status: 200 })
 }
 const anth = new anthropicMod.AnthropicMessagesAdapter({
-  options: () => ({ apiBaseURL: 'https://api.anthropic.com/v1/messages', maxTokens: 64000, models: [], defaultContextWindow: 1000000 }),
+  label: 'claude',
+  options: () => ({
+    apiBaseURL: 'https://api.anthropic.com/v1/messages',
+    maxTokens: 64000,
+    models: [{ id: 'claude-sonnet-5', name: 'Claude Sonnet 5', contextWindow: 1_000_000 }],
+    defaultContextWindow: 1000000,
+  }),
   resolveAccessToken: async () => ({ access: 't' }),
 })
 const anthChunks = []

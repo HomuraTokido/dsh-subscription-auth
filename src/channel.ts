@@ -36,6 +36,12 @@ export interface StoredToken {
   [key: string]: unknown
 }
 
+/**
+ * 刷新回调：拿到「当前令牌 + 取消信号」，返回刷新后的令牌。
+ * 信号必须贯通到 HTTP 请求（30 秒 boundedSignal），注销要能把它打断。
+ */
+export type RefreshToken = (token: StoredToken, signal: AbortSignal) => Promise<StoredToken>
+
 /** 渠道的配置：插件 Config 里的 `<id>` 段（volatile，经 configEditor 写回 profile）。 */
 export interface ChannelConfig {
   apiBaseURL?: string
@@ -85,8 +91,8 @@ export interface ChannelContext {
   options(): ResolvedChannelOptions
   /** settings 里尚未合并默认值的原始配置。 */
   getConfig(): ChannelConfig
-  /** 持久化配置片段（如 discoveredModels）。 */
-  updateConfig(patch: ChannelConfig): Promise<void>
+  /** 持久化配置片段（如 discoveredModels）；guard 在真正写的那一刻再验一次。 */
+  updateConfig(patch: ChannelConfig, guard?: () => boolean): Promise<void>
   credentials(): CredentialProvider | undefined
   /** 附件服务（读取用户上传的图片等）；宿主未安装该服务时返回 undefined。 */
   attachments(): AttachmentStore | undefined
@@ -95,8 +101,16 @@ export interface ChannelContext {
   notifyModelsChanged(): void
   /** 读取本渠道的令牌（不存在/损坏返回 undefined）。 */
   readToken(): Promise<StoredToken | undefined>
-  /** 写入本渠道令牌（JSON 字符串）。 */
-  writeToken(token: StoredToken): Promise<void>
+  /**
+   * 读令牌，快过期（<60s）先刷新并写回；未登录返回 undefined。
+   * 驱动侧实现为 credential 记录事务：跨进程串行，本地并发共享同一次刷新。
+   */
+  freshToken(refresh: RefreshToken): Promise<StoredToken | undefined>
+  /**
+   * 写入本渠道令牌；`isCurrent` 在真正落库前再校验一次（返回 false 就丢弃这次写入）。
+   * 返回是否成功落库（取消 / 被新尝试接管时为 false）。
+   */
+  writeToken(token: StoredToken, isCurrent?: () => boolean): Promise<boolean>
   /** 删除本渠道令牌。 */
   clearToken(): Promise<void>
   /** 登录成功后的后续动作（驱动实现为触发模型发现 + 重新注册 provider）。 */

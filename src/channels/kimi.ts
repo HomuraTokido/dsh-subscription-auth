@@ -10,8 +10,18 @@ import { LlmError } from '@deepseek-ai/dsh-llm'
 import { AnthropicMessagesAdapter } from '../adapters/anthropic.js'
 import type { AdapterModel } from '../adapter.js'
 import { pollDeviceFlow } from '../device-flow.js'
-import { openBrowser } from '../oauth.js'
-import type { ChannelContext, ChannelDefinition, ChannelReasoning, ChannelRuntime, StoredToken } from '../channel.js'
+import type { DevicePollResult } from '../device-flow.js'
+import { boundedSignal, openBrowser, readAuthJson } from '../oauth.js'
+import type {
+  AuthStatus,
+  ChannelContext,
+  ChannelDefinition,
+  ChannelReasoning,
+  ChannelRuntime,
+  LoginResult,
+} from '../channel.js'
+import type { StoredToken } from '../channel.js'
+import { AuthSession } from '../auth-session.js'
 
 const AUTH_BASE = 'https://auth.kimi.com'
 const DEVICE_AUTHORIZATION_URL = 'https://auth.kimi.com/api/oauth/device_authorization'
@@ -41,6 +51,11 @@ const REASONING: ChannelReasoning = {
 
 /** 进程内稳定的通用请求头（device id 只生成一次并缓存）。 */
 let deviceId: string | undefined
+
+/** `unknown` 错误的可读文本（catch 变量在 strict 下是 unknown，不能直接取 .message）。 */
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
 function kimiCommonHeaders(): Record<string, string> {
   if (deviceId === undefined) {
     deviceId = randomUUID().replace(/-/g, '')
@@ -66,20 +81,29 @@ interface DeviceAuthorization {
   interval: number
 }
 
-async function postForm(url: string, body: Record<string, string>, headers: Record<string, string> = {}): Promise<any> {
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      ...headers,
-    },
-    body: new URLSearchParams(body).toString(),
-  })
-  if (!res.ok) {
-    const text = await res.text().catch(() => '')
-    throw new Error(`HTTP ${res.status}: ${text.slice(0, 240)}`)
+async function postForm(
+  url: string,
+  body: Record<string, string>,
+  headers: Record<string, string> = {},
+  signal?: AbortSignal,
+): Promise<any> {
+  const request = boundedSignal(signal)
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        ...headers,
+      },
+      body: new URLSearchParams(body).toString(),
+      signal: request.signal,
+    })
+    // 失败只报 HTTP 状态码：响应体可能带令牌材料，不写进错误信息
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    return await readAuthJson(res, '令牌响应不是合法 JSON')
+  } finally {
+    request.cleanup()
   }
-  return res.json()
 }
 
 /** 设备授权轮询返回的令牌 JSON 转 StoredToken。 */
@@ -95,8 +119,8 @@ function toStoredToken(json: any, fallbackRefresh?: string): StoredToken {
   }
 }
 
-async function requestDeviceAuthorization(): Promise<DeviceAuthorization> {
-  const json = await postForm(DEVICE_AUTHORIZATION_URL, { client_id: CLIENT_ID }, kimiCommonHeaders())
+async function requestDeviceAuthorization(signal?: AbortSignal): Promise<DeviceAuthorization> {
+  const json = await postForm(DEVICE_AUTHORIZATION_URL, { client_id: CLIENT_ID }, kimiCommonHeaders(), signal)
   return {
     user_code: String(json.user_code ?? ''),
     device_code: String(json.device_code ?? ''),
@@ -111,11 +135,11 @@ async function pollToken(
   device: { device_code: string; expires_in: number; interval: number },
   signal?: AbortSignal,
 ): Promise<StoredToken> {
-  return pollDeviceFlow({
+  return pollDeviceFlow<StoredToken>({
     signal,
     expiresInSeconds: device.expires_in,
     intervalSeconds: device.interval,
-    poll: async () => {
+    poll: async (): Promise<DevicePollResult<StoredToken>> => {
       let json: any
       try {
         json = await postForm(
@@ -126,9 +150,11 @@ async function pollToken(
             grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
           },
           kimiCommonHeaders(),
+          signal,
         )
       } catch (error) {
-        // 瞬时网络错误视为 pending，继续轮询（轮询在 pollDeviceFlow 里不视为失败）
+        // 取消必须原样抛出去；其余瞬时网络错误视为 pending，继续轮询
+        if (signal?.aborted) throw error
         return { status: 'pending' }
       }
       if (json.access_token) {
@@ -145,11 +171,12 @@ async function pollToken(
   })
 }
 
-async function refreshAccessTokenInternal(refresh: string): Promise<StoredToken> {
+async function refreshAccessTokenInternal(refresh: string, signal?: AbortSignal): Promise<StoredToken> {
   const json = await postForm(
     TOKEN_URL,
     { grant_type: 'refresh_token', refresh_token: refresh, client_id: CLIENT_ID },
     kimiCommonHeaders(),
+    signal,
   )
   return toStoredToken(json, refresh)
 }
@@ -163,10 +190,9 @@ async function fetchModels(access: string): Promise<AdapterModel[]> {
     },
   })
   if (!res.ok) {
-    const text = await res.text().catch(() => '')
-    throw new Error(`models fetch failed (HTTP ${res.status}): ${text.slice(0, 240)}`)
+    throw new Error(`models fetch failed (HTTP ${res.status})`)
   }
-  const json: any = await res.json()
+  const json = await readAuthJson(res, '模型列表响应不是合法 JSON')
   const data: any[] = Array.isArray(json?.data) ? json.data : []
   return data.map((m: any) => {
     const id: string = typeof m?.id === 'string' ? m.id : ''
@@ -194,18 +220,15 @@ export const kimiChannel: ChannelDefinition = {
   reasoning: REASONING,
 
   create(ctx: ChannelContext): ChannelRuntime {
-    let controller: AbortController | undefined
-    let pending: { url: string; userCode: string } | undefined
+    const session = new AuthSession<{ url: string; userCode?: string }>({
+      log: ctx.log,
+      write: (token, isCurrent) => ctx.writeToken(token, isCurrent),
+      afterLogin: ctx.afterLogin,
+    })
 
     /** 读令牌，快过期就先刷新并写回；未登录返回 undefined。对话请求和模型发现共用。 */
-    const freshToken = async () => {
-      const token = await ctx.readToken()
-      if (!token) return undefined
-      if (token.expires - Date.now() >= 60_000) return token
-      const refreshed = await refreshAccessTokenInternal(token.refresh)
-      await ctx.writeToken(refreshed)
-      return refreshed
-    }
+    const freshToken = () =>
+      ctx.freshToken((token, signal) => refreshAccessTokenInternal(token.refresh, signal))
 
     const adapter = new AnthropicMessagesAdapter({
       options: () => ({
@@ -231,57 +254,66 @@ export const kimiChannel: ChannelDefinition = {
     return {
       adapter,
 
-      async login() {
+      async login(): Promise<LoginResult> {
+        // 先同步作废旧尝试（abort + 清 pending/error），再做任何 await。
+        const attempt = session.begin()
         const existing = await ctx.readToken()
+        if (!attempt.isCurrent()) throw new Error('aborted')
         if (existing && existing.expires > Date.now() + 60_000) {
+          session.settle(attempt)
           return { status: 'logged-in', account: existing.accountId }
         }
-        this.cancelLogin()
-        const device = await requestDeviceAuthorization()
-        controller = new AbortController()
-        pending = { url: device.verification_uri_complete, userCode: device.user_code }
-        if (device.verification_uri_complete) openBrowser(device.verification_uri_complete)
-        pollToken(device, controller.signal)
-          .then(async (token) => {
-            await ctx.writeToken(token)
-            ctx.log(`Kimi 登录成功，开始发现模型列表…`)
-            ctx.afterLogin()
-          })
-          .catch((error) => {
-            if (controller && !controller.signal.aborted) {
-              ctx.log(`Kimi 登录失败: ${error?.message ?? error}`)
-            }
-          })
-          .finally(() => {
-            pending = undefined
-          })
-        return {
-          status: 'pending',
-          url: device.verification_uri_complete,
-          userCode: device.user_code,
+        try {
+          const device = await requestDeviceAuthorization(attempt.signal)
+          if (!attempt.isCurrent()) throw new Error('aborted')
+          attempt.publish({ url: device.verification_uri_complete, userCode: device.user_code })
+          if (device.verification_uri_complete) openBrowser(device.verification_uri_complete)
+          pollToken(device, attempt.signal)
+            .then(async (token) => {
+              if (!attempt.isCurrent()) return
+              await session.succeed(attempt, token, 'Kimi 登录成功')
+            })
+            .catch((error: unknown) => { session.fail(attempt, error) })
+          return {
+            status: 'pending',
+            url: device.verification_uri_complete,
+            userCode: device.user_code,
+          }
+        } catch (error: unknown) {
+          session.fail(attempt, error)
+          throw error
         }
       },
 
-      async authStatus() {
+      async authStatus(): Promise<AuthStatus> {
         const token = await ctx.readToken()
         if (token) {
           return { provider: ctx.id, status: 'logged-in', account: token.accountId, expiresAt: token.expires }
         }
-        if (pending && controller && !controller.signal.aborted) {
-          return { provider: ctx.id, status: 'pending', url: pending.url, userCode: pending.userCode }
+        const pending = session.pending()
+        if (pending !== undefined) {
+          return {
+            provider: ctx.id,
+            status: 'pending',
+            url: pending.url,
+            ...(pending.userCode !== undefined ? { userCode: pending.userCode } : {}),
+          }
+        }
+        const error = session.lastError()
+        if (error !== undefined) {
+          return { provider: ctx.id, status: 'not-logged-in', error }
         }
         return { provider: ctx.id, status: 'not-logged-in' }
       },
 
       async logout() {
-        this.cancelLogin()
+        // 先 cancel（abort + 清 pending/error），再清凭据。
+        session.cancel()
         await ctx.clearToken()
       },
 
       cancelLogin() {
-        if (controller && !controller.signal.aborted) controller.abort()
-        controller = undefined
-        pending = undefined
+        session.cancel()
       },
 
       async discoverModels() {
@@ -290,7 +322,7 @@ export const kimiChannel: ChannelDefinition = {
           if (!token) return []
           return await fetchModels(token.access)
         } catch (error) {
-          ctx.log(`Kimi 模型列表发现失败: ${error?.message ?? error}`)
+          ctx.log(`Kimi 模型列表发现失败: ${messageOf(error)}`)
           return []
         }
       },
