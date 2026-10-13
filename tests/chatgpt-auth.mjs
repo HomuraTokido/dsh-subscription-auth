@@ -19,6 +19,10 @@
  *  5. 取消与「旧尝试 / 新尝试」隔离：取消后不再换令牌、不写凭据、不
  *     afterLogin；绑定等待期间取消要关掉监听器；设备码请求在途时取消 / 重试
  *     不覆盖新尝试；被取消的在途凭据写入先回滚、再写新尝试的令牌。
+ *  6. 轮询边界（可控时钟，不真等）：expiresInSeconds=0 不轮询；slow_down
+ *     逐次 +5s；最后一跳裁到 deadline 且到期后不再请求；间隔中取消清掉计时器；
+ *     failed 不重试；interval 非法值退回 5s；畸形 JSON 拒绝、结构错误不回显原文。
+ *  7. 两个渠道实例互不干扰（取消 A 不影响 B 完成）+ 回调重复到达 / state 不匹配。
  *
  * 生产代码里没有测试后门：node:http 与 node:child_process 在测试侧用 esbuild
  * 替换（见下面的 stub 源码），设备 wire 用 globalThis.fetch 替换。
@@ -38,12 +42,16 @@ const realFetch = globalThis.fetch
 const unhandled = []
 process.on('unhandledRejection', (reason) => { unhandled.push(reason) })
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+// 抓一份真实计时器 / 时钟：下面的 fake clock 会临时替换 globalThis.setTimeout 与
+// Date.now，测试自己的等待（waitFor / sleep）必须继续走真实实现。
+const realSetTimeout = globalThis.setTimeout.bind(globalThis)
+const realNow = Date.now.bind(Date)
+const sleep = (ms) => new Promise((resolve) => realSetTimeout(resolve, ms))
 
 /** 轮询等待条件成立（只用来等「发生」，不用来断言「没发生」）。 */
 async function waitFor(predicate, { timeout = 3000, interval = 10 } = {}) {
-  const deadline = Date.now() + timeout
-  while (Date.now() < deadline) {
+  const deadline = realNow() + timeout
+  while (realNow() < deadline) {
     if (await predicate()) return
     await sleep(interval)
   }
@@ -228,13 +236,54 @@ function deferred() {
   return { promise, resolve }
 }
 
+/**
+ * 可控时钟：临时替换 globalThis.setTimeout / clearTimeout / Date.now，让轮询里的 sleep
+ * 由测试主动击发，不必真等 1s / 15 分钟。测试自身的等待走上面的 realSetTimeout。
+ */
+function installFakeClock(start = 1_700_000_000_000) {
+  const realSet = globalThis.setTimeout
+  const realClear = globalThis.clearTimeout
+  const realDateNow = Date.now
+  let now = start
+  let nextId = 1
+  const timers = new Map()
+  Date.now = () => now
+  globalThis.setTimeout = (fn, ms = 0) => {
+    const id = nextId++
+    timers.set(id, { fn, at: now + Math.max(0, ms) })
+    return id
+  }
+  globalThis.clearTimeout = (id) => { timers.delete(id) }
+  const ats = () => [...timers.values()].map((timer) => timer.at)
+  return {
+    pendingDelays: () => ats().map((at) => at - now).sort((a, b) => a - b),
+    pendingCount: () => timers.size,
+    /** 把时钟推进到最早的计时器并执行它。 */
+    fireNext() {
+      if (timers.size === 0) return
+      now = Math.max(now, Math.min(...ats()))
+      for (const [id, timer] of [...timers]) {
+        if (timer.at <= now) {
+          timers.delete(id)
+          timer.fn()
+        }
+      }
+    },
+    restore() {
+      Date.now = realDateNow
+      globalThis.setTimeout = realSet
+      globalThis.clearTimeout = realClear
+      timers.clear()
+    },
+  }
+}
+
 function openedBrowsers() {
   return globalThis.__testChildProcess.spawns.map((entry) => entry.args[entry.args.length - 1])
 }
 
 /** 把一个假的回调请求交给假 http 服务器（等价于浏览器跳回 localhost）。 */
-function deliverCallback(port, params) {
-  const server = stubServer(port)
+function deliverCallback(port, params, server = stubServer(port)) {
   assert.ok(server, `没有监听 ${port} 的回调服务器`)
   const res = {
     statusCode: 0,
@@ -1031,6 +1080,263 @@ async function testCancellationAndIsolation(channel) {
   console.log('✓ 5g. 写入凭据失败：尽力清理 + authStatus.error')
 }
 
+// ---------- 6. 设备轮询边界（可控时钟，不真等 15 分钟） ----------
+
+async function testDevicePollBoundaries(device) {
+  {
+    // expiresInSeconds = 0：deadline 已过 → 一次轮询都不发、不留计时器
+    const calls = installDeviceWire({})
+    await assert.rejects(
+      device.waitForDeviceAuthorization(deviceStart({ expiresInSeconds: 0 })),
+      /设备授权超时/,
+    )
+    assert.equal(calls.poll.length, 0, '过期时间已到就不该发轮询请求')
+  }
+  console.log('✓ 6a. expiresInSeconds=0：不轮询，直接到时超时')
+
+  {
+    // slow_down：间隔 1s → 6s → 11s（每次 +5s），完成后不再轮询
+    const clock = installFakeClock()
+    try {
+      const statuses = ['slow_down', 'slow_down', 'complete']
+      let polls = 0
+      const promise = device.pollDeviceFlow({
+        intervalSeconds: 1,
+        expiresInSeconds: 3600,
+        poll: () => {
+          polls += 1
+          const status = statuses.shift() ?? 'complete'
+          return status === 'complete' ? { status, value: 'done' } : { status }
+        },
+      })
+      await waitFor(() => clock.pendingDelays().length === 1)
+      assert.deepEqual(clock.pendingDelays(), [6000], '第一次 slow_down 后 1s → 6s')
+      clock.fireNext()
+      await waitFor(() => clock.pendingDelays().length === 1)
+      assert.deepEqual(clock.pendingDelays(), [11000], '第二次 slow_down 后 6s → 11s')
+      clock.fireNext()
+      assert.equal(await promise, 'done')
+      assert.equal(polls, 3)
+      assert.equal(clock.pendingCount(), 0, '完成后不留计时器')
+    } finally {
+      clock.restore()
+    }
+  }
+  console.log('✓ 6b. pollDeviceFlow slow_down：间隔逐次 +5s（1s→6s→11s）')
+
+  {
+    // 最后一跳被裁到 deadline：1.5s 窗口 + 1s 间隔 → sleep 1s、再 0.5s，然后到时
+    const clock = installFakeClock()
+    try {
+      let polls = 0
+      globalThis.fetch = async () => {
+        polls += 1
+        return json({}, 403)
+      }
+      const promise = device.waitForDeviceAuthorization(deviceStart({ intervalSeconds: 1, expiresInSeconds: 1.5 }))
+      await waitFor(() => clock.pendingDelays().length === 1)
+      assert.deepEqual(clock.pendingDelays(), [1000])
+      clock.fireNext()
+      await waitFor(() => clock.pendingDelays().length === 1)
+      assert.deepEqual(clock.pendingDelays(), [500], '最后一跳裁到剩余时间')
+      clock.fireNext()
+      await assert.rejects(promise, /设备授权超时/)
+      assert.equal(polls, 2, '到期后不得再轮询')
+      assert.equal(clock.pendingCount(), 0, '不留活计时器')
+    } finally {
+      clock.restore()
+    }
+  }
+  console.log('✓ 6c. 窗口到期：最后一跳裁到剩余时间，之后不再发请求')
+
+  {
+    // 睡在轮询间隔里被取消：不再轮询，且 sleep 的计时器被清掉
+    const clock = installFakeClock()
+    try {
+      const controller = new AbortController()
+      let polls = 0
+      globalThis.fetch = async () => {
+        polls += 1
+        return json({}, 403)
+      }
+      const promise = device.waitForDeviceAuthorization(
+        deviceStart({ intervalSeconds: 1, expiresInSeconds: 900 }),
+        controller.signal,
+      )
+      await waitFor(() => clock.pendingDelays().length === 1)
+      controller.abort()
+      await assert.rejects(promise, /aborted/)
+      assert.equal(polls, 1, '取消后不得再轮询')
+      assert.equal(clock.pendingCount(), 0, 'sleep 的计时器要被清掉')
+    } finally {
+      clock.restore()
+    }
+  }
+  console.log('✓ 6d. 间隔中取消：不再轮询，sleep 计时器被清掉')
+
+  {
+    // 终止性失败（非 pending）不重试
+    const calls = installDeviceWire({ polls: [{ status: 500 }] })
+    await assert.rejects(device.waitForDeviceAuthorization(deviceStart()), /设备授权失败 \(HTTP 500\)/)
+    assert.equal(calls.poll.length, 1, 'failed 之后不得重试')
+  }
+  console.log('✓ 6e. 设备授权失败不重试')
+
+  {
+    // interval 非法值一律退回默认 5s（合法值保留）
+    for (const [label, interval] of [
+      ['非数字字符串', 'abc'],
+      ['零', 0],
+      ['负数', -3],
+      ['Infinity', Infinity],
+      ['NaN', NaN],
+      ['null', null],
+      ['缺字段', undefined],
+    ]) {
+      installDeviceWire({
+        usercodeBody: { device_auth_id: 'dev-1', user_code: 'CODE-1', ...(interval === undefined ? {} : { interval }) },
+      })
+      const start = await device.requestDeviceAuthorization()
+      assert.equal(start.intervalSeconds, 5, `${label} 应退回默认 5s`)
+    }
+    installDeviceWire({ usercodeBody: { device_auth_id: 'dev-1', user_code: 'CODE-1', interval: 7 } })
+    assert.equal((await device.requestDeviceAuthorization()).intervalSeconds, 7)
+  }
+  console.log('✓ 6f. interval 非法值（非数字/0/负/Infinity/NaN/null/缺失）退回 5s')
+
+  {
+    // 畸形 JSON 要拒绝；结构错误不回显响应原文。解析错误的原文泄漏由独立 TODO 回归记录。
+    const secret = 'SECRET-CODE-XYZ'
+    globalThis.fetch = async () => new Response('{ "device_auth_id": "dev-1", ', { status: 200 })
+    await assert.rejects(device.requestDeviceAuthorization(), '畸形 JSON 应当 reject')
+
+    for (const [label, body] of [
+      ['null', 'null'],
+      ['数组', '[]'],
+      ['字符串', JSON.stringify(secret)],
+      ['空字段带密值', JSON.stringify({ device_auth_id: '', user_code: '', secret })],
+    ]) {
+      globalThis.fetch = async () => new Response(body, { status: 200 })
+      let error
+      try {
+        await device.requestDeviceAuthorization()
+      } catch (caught) {
+        error = caught
+      }
+      assert.ok(error, `${label}：应当 reject`)
+      assert.ok(!String(error.message).includes(secret), `${label}：不得回显响应原文（${error.message}）`)
+    }
+
+    globalThis.fetch = async () => new Response(JSON.stringify({ authorization_code: '', secret }), { status: 200 })
+    const failed = await device.pollDeviceAuthorization('dev-1', 'CODE')
+    assert.equal(failed.status, 'failed')
+    assert.ok(!failed.message.includes(secret), '轮询失败信息不得回显响应原文')
+  }
+  console.log('✓ 6g. 畸形 JSON 拒绝，结构错误不回显响应原文')
+}
+
+// ---------- 7. 两个本地实例互不干扰 + 回调重复到达 ----------
+
+async function testInstanceIsolationAndCallbackReplay(channel) {
+  {
+    // 两个渠道实例（两个本地 dsh 实例）：设备码与 controller 各自独立，
+    // 取消 A 不影响 B 完成，A 迟到的授权响应也不写 A 的凭据
+    resetHttpStub([[1455, 'EADDRINUSE'], [1457, 'EADDRINUSE']])
+    let usercodes = 0
+    let releaseA
+    const exchanges = []
+    globalThis.fetch = async (url, init) => {
+      if (url.endsWith('/usercode')) {
+        usercodes += 1
+        return json({ device_auth_id: `dev-${usercodes}`, user_code: `CODE-${usercodes}`, interval: 1 })
+      }
+      if (url.endsWith('/deviceauth/token')) {
+        const body = JSON.parse(init.body)
+        if (body.device_auth_id === 'dev-1') {
+          return await new Promise((resolve) => {
+            releaseA = () => resolve(json({ authorization_code: 'ac-A', code_verifier: 'cv-A' }))
+          })
+        }
+        return json({ authorization_code: 'ac-B', code_verifier: 'cv-B' })
+      }
+      if (url.endsWith('/oauth/token')) {
+        const code = new URLSearchParams(init.body).get('code')
+        exchanges.push(code)
+        return json({ access_token: 'access-' + code, refresh_token: 'r', expires_in: 600 })
+      }
+      throw new Error('unexpected ' + url)
+    }
+    const a = createHarness(channel)
+    const b = createHarness(channel)
+    const loginA = await a.runtime.login()
+    const loginB = await b.runtime.login()
+    assert.equal(loginA.userCode, 'CODE-1')
+    assert.equal(loginB.userCode, 'CODE-2', '两个实例拿到的设备码必须各自独立')
+
+    a.runtime.cancelLogin()
+    await waitFor(() => b.state.written.length === 1)
+    assert.deepEqual(exchanges, ['ac-B'], '取消 A 后只有 B 换令牌')
+    assert.equal(b.state.written[0].access, 'access-ac-B')
+    assert.equal(b.state.afterLoginCalls, 1)
+    assert.equal((await b.runtime.authStatus()).status, 'logged-in')
+    assert.equal(a.state.written.length, 0)
+    assert.equal(a.state.afterLoginCalls, 0)
+    assert.equal((await a.runtime.authStatus()).status, 'not-logged-in')
+
+    releaseA()
+    await sleep(20)
+    assert.equal(a.state.written.length, 0, 'A 被取消后不得写凭据')
+    assert.deepEqual(exchanges, ['ac-B'], 'A 被取消后不得换令牌')
+    assert.equal((await a.runtime.authStatus()).status, 'not-logged-in')
+  }
+  console.log('✓ 7a. 两个实例：设备码/controller/凭据独立，取消 A 不影响 B 完成')
+
+  {
+    // 重复到达的同一个成功回调：只换码 / 写一次 / afterLogin 一次 / 只开一次页面，端口释放
+    resetHttpStub([])
+    const { runtime, state } = createHarness(channel)
+    let exchanges = 0
+    globalThis.fetch = async (url) => {
+      assert.equal(url, 'https://auth.openai.com/oauth/token')
+      exchanges += 1
+      return json({ access_token: 'access-once', refresh_token: 'r', expires_in: 600 })
+    }
+    const result = await runtime.login()
+    const server = stubServer(1455)
+    const params = { code: 'cb-once', state: new URL(result.url).searchParams.get('state') }
+    const first = deliverCallback(1455, params, server)
+    const replay = deliverCallback(1455, params, server) // 浏览器重放 / 用户刷新回调页
+    assert.equal(first.statusCode, 200)
+    assert.equal(replay.statusCode, 200, '重复请求仍回成功页，但不得产生副作用')
+    await waitFor(() => state.written.length === 1)
+    await sleep(20)
+    assert.equal(exchanges, 1, '重复回调只能换一次令牌')
+    assert.equal(state.written.length, 1)
+    assert.equal(state.afterLoginCalls, 1)
+    assert.deepEqual(openedBrowsers(), [result.url], '不得因为重复回调再打开页面')
+    assert.deepEqual(listenedPorts(), [], '拿到 code 后端口要释放')
+    assert.equal(httpStub().closed, 1)
+  }
+  console.log('✓ 7b. 重复成功回调：换码/写入/afterLogin 各一次，端口释放')
+
+  {
+    // state 不匹配的回调：不写令牌 / 不开页面 / 进 authStatus.error / 端口释放
+    resetHttpStub([])
+    const { runtime, state } = createHarness(channel)
+    globalThis.fetch = neverExpected('state 不匹配的回调')
+    const result = await runtime.login()
+    const res = deliverCallback(1455, { code: 'cb-bad', state: 'wrong-state' })
+    assert.equal(res.statusCode, 400)
+    await waitFor(async () => (await runtime.authStatus()).status !== 'pending')
+    assert.equal(state.written.length, 0, 'state 不匹配不得写令牌')
+    assert.deepEqual(openedBrowsers(), [result.url], '不得再打开页面')
+    assert.match((await runtime.authStatus()).error, /state/)
+    assert.deepEqual(listenedPorts(), [], '失败后端口也要释放')
+    assert.equal(httpStub().closed, 1)
+  }
+  console.log('✓ 7c. state 不匹配的回调：不写令牌 / 不开页面 / error 可见 / 端口释放')
+}
+
 async function main() {
   await rm(tmp, { recursive: true, force: true })
   await mkdir(tmp, { recursive: true })
@@ -1043,6 +1349,7 @@ async function main() {
   const module_ = await bundle(
     `export * from './src/oauth.ts'
 export * from './src/chatgpt-device-auth.ts'
+export * from './src/device-flow.ts'
 export { chatgptChannel, callbackPortCandidates } from './src/channels/chatgpt.ts'`,
     join(tmp, 'chatgpt.mjs'),
     [stubPlugin({ 'node:http': httpStubPath, 'node:child_process': childProcessStubPath })],
@@ -1056,6 +1363,8 @@ export { chatgptChannel, callbackPortCandidates } from './src/channels/chatgpt.t
     await testCancelWhileBinding(module_)
     await testDeviceFallback(module_)
     await testCancellationAndIsolation(module_)
+    await testDevicePollBoundaries(module_)
+    await testInstanceIsolationAndCallbackReplay(module_)
     await sleep(150)
     assert.equal(unhandled.length, 0, `出现 unhandledRejection: ${unhandled.map(String).join(', ')}`)
     console.log('\nchatgpt-auth 全部通过 ✔')
