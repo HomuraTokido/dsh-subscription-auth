@@ -13,7 +13,7 @@
 
 ## 宿主要求
 
-使用 DSH 0.2.1 alpha 系列的原生凭据记录与事务接口，或提供相同接口的 DSR。具体依赖契约以 `package.json` 为准；不再宣称兼容尚无 `CredentialProvider.modifyRecord` 的旧宿主。
+使用 DSH 0.2.1 alpha 系列的原生凭据记录与事务接口，或提供相同接口的 DSR。PiAiAdapter 与插件直接使用的 pi-ai 应解析到同一 SDK 版本，避免公开类型中的唯一标记发生版本分裂。具体依赖契约以 `package.json` 为准；不再宣称兼容尚无 `CredentialProvider.modifyRecord` 的旧宿主。
 
 需要 Node.js 20 或更新版本，以及宿主的 LLM、credentials、settings、PiAiAdapter 服务包。图片输入需要宿主 attachment 服务。宿主没有附件服务或模型不支持图片时，适配器给出明确错误。
 
