@@ -342,10 +342,14 @@ async function* translate(body: ReadableStream<Uint8Array>): AsyncIterable<Strea
         break
       }
       case 'error': {
-        throw new LlmError(
-          chunk?.message ?? String(chunk?.error ?? 'provider stream error'),
-          'PROVIDER',
-        )
+        const error = chunk?.error
+        const detail = typeof chunk?.message === 'string' ? chunk.message
+          : typeof error?.message === 'string' ? error.message
+          : typeof error === 'string' ? error
+          : 'provider stream error'
+        const code = typeof error?.code === 'string' ? error.code
+          : typeof chunk?.code === 'string' ? chunk.code : undefined
+        throw new LlmError(code ? `${detail} (${code})` : detail, 'PROVIDER')
       }
       default:
         break
