@@ -18,7 +18,7 @@
  * 且上一轮请求返回后才 sleep，不会重叠轮询）。
  * @module dsh-subscription-auth/chatgpt-device-auth
  */
-import { AUTH_BASE, CLIENT_ID, boundedSignal, exchangeAuthorizationCode } from './oauth.js'
+import { AUTH_BASE, CLIENT_ID, boundedSignal, exchangeAuthorizationCode, readAuthJson } from './oauth.js'
 import type { StoredToken } from './oauth.js'
 import { pollDeviceFlow } from './device-flow.js'
 import type { DevicePollResult } from './device-flow.js'
@@ -76,7 +76,7 @@ export async function requestDeviceAuthorization(signal?: AbortSignal): Promise<
       signal: request.signal,
     })
     if (!res.ok) throw new Error(`设备授权请求失败 (HTTP ${res.status})`)
-    const body = (await res.json()) as any
+    const body = await readAuthJson(res, '设备授权响应不是合法 JSON')
     const deviceAuthId = typeof body?.device_auth_id === 'string' ? body.device_auth_id : ''
     const userCode = typeof body?.user_code === 'string' && body.user_code !== ''
       ? body.user_code
@@ -115,7 +115,7 @@ export async function pollDeviceAuthorization(
     })
     if (res.status === 403 || res.status === 404) return { status: 'pending' }
     if (!res.ok) return { status: 'failed', message: `设备授权失败 (HTTP ${res.status})` }
-    const body = (await res.json()) as any
+    const body = await readAuthJson(res, '设备授权响应不是合法 JSON')
     const authorizationCode = typeof body?.authorization_code === 'string' ? body.authorization_code : ''
     const codeVerifier = typeof body?.code_verifier === 'string' ? body.code_verifier : ''
     if (authorizationCode === '' || codeVerifier === '') {

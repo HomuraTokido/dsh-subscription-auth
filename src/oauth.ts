@@ -123,6 +123,20 @@ export function openBrowser(url: string): void {
   }
 }
 
+/** Parse auth JSON without exposing response fragments in parser errors.
+ * Preserve cancellation and body-read/network errors unchanged.
+ */
+export async function readAuthJson(response: Pick<Response, 'json'>, failureMessage: string): Promise<any> {
+  try {
+    return await response.json()
+  } catch (error) {
+    if (error instanceof SyntaxError || (error as { name?: string })?.name === 'SyntaxError') {
+      throw new Error(failureMessage)
+    }
+    throw error
+  }
+}
+
 function toStoredToken(json: any, fallbackRefresh: string | undefined): StoredToken {
   const access = typeof json.access_token === 'string' ? json.access_token : ''
   if (access === '') throw new Error('token response missing access_token')
@@ -187,7 +201,7 @@ export async function exchangeAuthorizationCode(
       signal: request.signal,
     })
     if (!res.ok) throw new Error(`token exchange failed (HTTP ${res.status})`)
-    return toStoredToken(await res.json(), undefined)
+    return toStoredToken(await readAuthJson(res, 'token response is not valid JSON'), undefined)
   } finally {
     request.cleanup()
   }
@@ -209,7 +223,7 @@ export async function refreshAccessToken(refresh: string): Promise<StoredToken> 
     }).toString(),
   })
   if (!res.ok) throw new Error(`token refresh failed (HTTP ${res.status})`)
-  return toStoredToken(await res.json(), refresh)
+  return toStoredToken(await readAuthJson(res, 'token refresh response is not valid JSON'), refresh)
 }
 
 function escapeHtml(s: string): string {
